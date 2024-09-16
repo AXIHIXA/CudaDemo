@@ -27,6 +27,16 @@ __global__ void transposeNaive(const float * __restrict__ in, int nx, int ny, fl
 }
 
 
+/// Read input in row-major, store into smem (padded) in row-major.
+/// Write to output in row major.
+/// This will essentially read smem in column-major.
+/// That is, a thread will NOT write the data it reads.
+///
+/// Do NOT exit if thread id is out of bound!
+/// Because threads do not write what they read,
+/// margin (remainder) elements will be read by in-bound threads
+/// (with these in-bound threads write NOTHING)
+/// but written by out-of-bound threads!
 template <int kPadding = 1>
 __global__ void transpose(const float * __restrict__ in, int nx, int ny, float * __restrict__ out)
 {
@@ -34,18 +44,6 @@ __global__ void transpose(const float * __restrict__ in, int nx, int ny, float *
 
     unsigned ix = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned iy = blockIdx.y * blockDim.y + threadIdx.y;
-
-    // Read input in row-major, store into smem (padded) in row-major.
-    // Write to output in row major.
-    // This will essentially read smem in column-major.
-    // That is, a thread will NOT write the data it reads.
-
-    // Do NOT exit if thread id is out of bound!
-    // Because threads do not write what they read,
-    // margin (remainder) elements will be read by in-bound threads
-    // (with these in-bound threads write NOTHING)
-    // but written by out-of-bound threads!
-
     unsigned from = iy * nx + ix;
     unsigned s = threadIdx.y * (blockDim.x + kPadding) + threadIdx.x;
 
@@ -56,19 +54,12 @@ __global__ void transpose(const float * __restrict__ in, int nx, int ny, float *
 
     __syncthreads();
 
-    unsigned tIdxInBlock = threadIdx.y * blockDim.x + threadIdx.x;
+    unsigned t = threadIdx.y * blockDim.x + threadIdx.x;
 
-    #ifndef NDEBUG
-    if (blockIdx.y == -1)
-    {
-        printf("b[%u] t[%u] -- smem[%u] = in[%u] (%f)\n",
-               blockIdx.y * blockDim.x + blockIdx.x, tIdxInBlock,
-               s, from, smem[s]);
-    }
-    #endif
-
-    unsigned sx = tIdxInBlock / blockDim.y;
-    unsigned sy = tIdxInBlock % blockDim.y;
+    // This thread will write t-th (column major) element in smem.
+    // What's its x, y coordinates in this block?
+    unsigned sx = t / blockDim.y;
+    unsigned sy = t % blockDim.y;
     s = sy * (blockDim.x + kPadding) + sx;
 
     ix = blockIdx.y * blockDim.y + sy;
@@ -79,15 +70,6 @@ __global__ void transpose(const float * __restrict__ in, int nx, int ny, float *
     {
         out[to] = smem[s];
     }
-
-    #ifndef NDEBUG
-    if (blockIdx.y == -1)
-    {
-        printf("b[%u] t[%u] -- out[%u] = smem[%u] (%f)\n",
-               blockIdx.y * blockDim.x + blockIdx.x, tIdxInBlock,
-               to, s, smem[s]);
-    }
-    #endif
 }
 
 
@@ -104,6 +86,9 @@ __global__ void transposeUnroll(const float * __restrict__ in, int nx, int ny, f
     #pragma unroll
     for (int u = 0; u < kNItems && ix + blockDim.x * u < nx && iy < ny; ++u)
     {
+        // The next element-to-read for this thread spans blockDim.x * blockDim.y elements (row-major)
+        // in this thread block (of size blockDim.x * blockDim.y).
+        // The linear index in smem and in input spans by blockDim.x. 
         smem[s + blockDim.x * u] = in[from + blockDim.x * u];
     }
 
@@ -121,6 +106,9 @@ __global__ void transposeUnroll(const float * __restrict__ in, int nx, int ny, f
     #pragma unroll
     for (int u = 0; u < kNItems && ix < ny && iy + blockDim.x * u < nx; ++u)
     {
+        // The next element-to-write for this thread spans blockDim.x * blockDim.y elements (row-major)
+        // in the output block (of x size blockDim.y, y size blockDim.x), i.e., blockDim.x rows.
+        // The row-major index in output array spans by blockDim.x * ny.
         out[to + ny * blockDim.x * u] = smem[s + blockDim.x * u];
     }
 }
@@ -209,7 +197,6 @@ int main(int argc, char * argv[])
     checkResult(h_in, r, c, h_out);
 
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
-
     constexpr int kNItems = 4;
     transposeUnroll<kPad, kNItems><<<grid, block, (block.x * kNItems + kPad) * block.y * sizeof(float)>>>(
             d_in.data().get(), c, r, d_out.data().get());
