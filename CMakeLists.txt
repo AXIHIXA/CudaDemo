@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.23)
+cmake_minimum_required(VERSION 3.25)
 project(CudaDemo CUDA CXX)
 
 # Ensure correct CUDA architecture
@@ -31,7 +31,7 @@ set(ALL_COMPILE_OPTS
         $<$<CONFIG:DEBUG>:-O0>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:-G>
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
-        --relocatable-device-code=true
+        $<$<COMPILE_LANGUAGE:CUDA>:--relocatable-device-code=true>
 )
 
 set(DEMO demo)
