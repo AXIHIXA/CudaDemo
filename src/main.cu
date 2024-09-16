@@ -5,7 +5,6 @@
 #include <iostream>
 #include <numeric>
 #include <vector>
-#include <random>
 
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
@@ -14,109 +13,17 @@
 #include "utils/cuda_utils.h"
 
 
-/// Dynamic parallelism needs nvcc flag --relocatable-device-code=true
-/// and set_target_properties(${DEMO} PROPERTIES CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-
-
-struct Add
+__global__ void transposeNaive(const float * __restrict__ in, int nx, int ny, float * __restrict__ out)
 {
-    __host__ __device__ __forceinline__ float operator()(float a, float b)
+    unsigned x = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < nx && y < ny)
     {
-        return a + b;
+        unsigned from = y * nx + x;
+        unsigned to = x * ny + y;
+        out[to] = in[from];
     }
-};
-
-
-struct RowIt
-{
-    using iterator_category = std::random_access_iterator_tag;
-    using value_type = float;
-    using difference_type = ptrdiff_t;
-    using pointer = float *;
-    using reference = float &;
-
-    friend __host__ __device__ bool operator!=(const RowIt & a, const RowIt & b);
-
-    friend __host__ __device__ RowIt operator+(const RowIt & a, int diff);
-
-    __host__ __device__ RowIt(float * u, int w, int h) : u(u), w(w), h(h)
-    {
-
-    }
-
-    __host__ __device__ float & operator*()
-    {
-        return *u;
-    }
-
-    __host__ __device__ float & operator[](size_t i)
-    {
-        return u[i * w];
-    }
-
-    __host__ __device__ RowIt & operator++()
-    {
-        u += w;
-        return *this;
-    }
-
-    float * u;
-    int w;
-    int h;
-};
-
-
-__host__ __device__ bool operator!=(const RowIt & a, const RowIt & b)
-{
-    return a.u != b.u;
-}
-
-
-__host__ __device__ RowIt operator+(const RowIt & a, int diff)
-{
-    return {a.u + a.w * diff, a.w, a.h};
-}
-
-
-namespace std
-{
-
-template <>
-struct iterator_traits<RowIt>
-{
-    using iterator_category = RowIt::iterator_category;
-    using value_type = RowIt::value_type;
-    using difference_type = RowIt::difference_type;
-    using pointer = RowIt::pointer;
-    using reference = RowIt::reference;
-};
-
-}  // namespace std
-
-
-__global__ void scan1(float * u, int ww, int hh)
-{
-//    extern __shared__ unsigned char smem[];
-//    float * su = reinterpret_cast<float *>(smem);
-
-    size_t tempStorageBytes = 0;
-    Add add;
-    cub::DeviceScan::InclusiveScan(nullptr, tempStorageBytes, u, u, add, ww);
-    float * tempStorage = nullptr;
-    cudaMalloc(&tempStorage, tempStorageBytes * hh);
-
-    for (int h = 0; h < hh; ++h)
-    {
-        cub::DeviceScan::InclusiveScan(tempStorage + h * ww, tempStorageBytes, u + h * ww, u + h * ww, add, ww);
-    }
-
-    for (int w = 0; w < ww; ++w)
-    {
-        cub::DeviceScan::InclusiveScan(tempStorage + w * hh, tempStorageBytes, RowIt(u + w, ww, hh), RowIt(u + w, ww, hh), add, ww);
-    }
-
-    __syncthreads();
-    cudaFree(tempStorage);
 }
 
 
@@ -127,6 +34,17 @@ __global__ void transpose(const float * __restrict__ in, int nx, int ny, float *
 
     unsigned ix = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned iy = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Read input in row-major, store into smem (padded) in row-major.
+    // Write to output in row major.
+    // This will essentially read smem in column-major.
+    // That is, a thread will NOT write the data it reads.
+
+    // Do NOT exit if thread id is out of bound!
+    // Because threads do not write what they read,
+    // margin (remainder) elements will be read by in-bound threads
+    // (with these in-bound threads write NOTHING)
+    // but written by out-of-bound threads!
 
     unsigned from = iy * nx + ix;
     unsigned s = threadIdx.y * (blockDim.x + kPadding) + threadIdx.x;
@@ -140,6 +58,15 @@ __global__ void transpose(const float * __restrict__ in, int nx, int ny, float *
 
     unsigned tIdxInBlock = threadIdx.y * blockDim.x + threadIdx.x;
 
+    #ifndef NDEBUG
+    if (blockIdx.y == -1)
+    {
+        printf("b[%u] t[%u] -- smem[%u] = in[%u] (%f)\n",
+               blockIdx.y * blockDim.x + blockIdx.x, tIdxInBlock,
+               s, from, smem[s]);
+    }
+    #endif
+
     unsigned sx = tIdxInBlock / blockDim.y;
     unsigned sy = tIdxInBlock % blockDim.y;
     s = sy * (blockDim.x + kPadding) + sx;
@@ -152,125 +79,160 @@ __global__ void transpose(const float * __restrict__ in, int nx, int ny, float *
     {
         out[to] = smem[s];
     }
+
+    #ifndef NDEBUG
+    if (blockIdx.y == -1)
+    {
+        printf("b[%u] t[%u] -- out[%u] = smem[%u] (%f)\n",
+               blockIdx.y * blockDim.x + blockIdx.x, tIdxInBlock,
+               to, s, smem[s]);
+    }
+    #endif
 }
 
 
-__global__ void scan2(float * u, float * v, int ww, int hh)
+template <int kPadding = 1, int kNItems = 1>
+__global__ void transposeUnroll(const float * __restrict__ in, int nx, int ny, float * __restrict__ out)
 {
-    size_t tempStorageBytes = 0;
-    Add add;
-    cub::DeviceScan::InclusiveScan(nullptr, tempStorageBytes, u, u, add, ww);
-    float * tempStorage = nullptr;
-    cudaMalloc(&tempStorage, tempStorageBytes * hh);
+    extern __shared__ float smem[];
 
-    for (int h = 0; h < hh; ++h)
+    unsigned ix = blockIdx.x * (blockDim.x * kNItems) + threadIdx.x;
+    unsigned iy = blockIdx.y * blockDim.y + threadIdx.y;
+    unsigned from = iy * nx + ix;
+    unsigned s = threadIdx.y * (blockDim.x * kNItems + kPadding) + threadIdx.x;
+
+    #pragma unroll
+    for (int u = 0; u < kNItems && ix + blockDim.x * u < nx && iy < ny; ++u)
     {
-        cub::DeviceScan::InclusiveScan(tempStorage + h * ww, tempStorageBytes, u + h * ww, u + h * ww, add, ww);
+        smem[s + blockDim.x * u] = in[from + blockDim.x * u];
     }
 
-    constexpr dim3 block = {32, 32};
-    dim3 grid = {(ww + block.x - 1) / block.x, (hh + block.y - 1) / block.y};
-    transpose<<<grid, block, (block.x + 1) * block.y * sizeof(float)>>>(u, ww, hh, v);
     __syncthreads();
 
-    // TODO: w != h
-    for (int h = 0; h < hh; ++h)
+    unsigned t = threadIdx.y * blockDim.x + threadIdx.x;
+    unsigned sx = t / blockDim.y;
+    unsigned sy = t % blockDim.y;
+    s = sy * (blockDim.x * kNItems + kPadding) + sx;
+
+    ix = blockIdx.y * blockDim.y + sy;
+    iy = blockIdx.x * (blockDim.x * kNItems) + sx;
+    unsigned to = iy * ny + ix;
+
+    #pragma unroll
+    for (int u = 0; u < kNItems && ix < ny && iy + blockDim.x * u < nx; ++u)
     {
-        cub::DeviceScan::InclusiveScan(tempStorage + h * ww, tempStorageBytes, v + h * ww, v + h * ww, add, ww);
+        out[to + ny * blockDim.x * u] = smem[s + blockDim.x * u];
+    }
+}
+
+
+void print(const thrust::host_vector<float> & in, int r, int c, const thrust::host_vector<float> & out)
+{
+    for (int i = 0; i < r; ++i)
+    {
+        for (int j = 0; j < c; ++j)
+        {
+            printf("%.1f ", in[i * c + j]);
+        }
+
+        std::printf("\n");
     }
 
-    transpose<<<grid, block, (block.x + 1) * block.y * sizeof(float)>>>(v, ww, hh, u);
+    std::printf("\n");
 
-    __syncthreads();
-    cudaFree(tempStorage);
+    for (int i = 0; i < c; ++i)
+    {
+        for (int j = 0; j < r; ++j)
+        {
+            printf("%.1f ", out[i * r + j]);
+        }
+
+        std::printf("\n");
+    }
+
+    std::printf("\n");
+}
+
+
+void checkResult(const thrust::host_vector<float> & in, int r, int c, const thrust::host_vector<float> & out)
+{
+    #ifndef NDEBUG
+    print(in, r, c, out);
+    #endif
+
+    bool resultIsCorrect = true;
+
+    for (int i = 0, shouldBreak = false; !shouldBreak && i < r; ++i)
+    {
+        for (int j = 0; !shouldBreak && j < c; ++j)
+        {
+            if (in[i * c + j] != out[j * r + i])
+            {
+                resultIsCorrect = false;
+                shouldBreak = true;
+            }
+        }
+    }
+
+    std::printf("Result is %s\n\n", resultIsCorrect ? "correct." : "WRONG!!!");
 }
 
 
 int main(int argc, char * argv[])
 {
-    constexpr int r = 256;
-    constexpr int c = 256;
+    constexpr int r = 21027;
+    constexpr int c = 10149;
     constexpr int rc = r * c;
     thrust::host_vector<float> h_in(rc);
+    std::iota(h_in.begin(), h_in.end(), 0.0f);
+    thrust::device_vector<float> d_in = h_in;
+    thrust::device_vector<float> d_out(rc);
+    thrust::host_vector<float> h_out;
 
-    std::random_device rd;
-    unsigned long long seed = rd();
-    std::default_random_engine e(seed);
-    std::normal_distribution<float> nd;
-    auto gen = [&nd, &e]() { return nd(e); };
+    constexpr dim3 block = {32, 32};
+    dim3 grid = {(c + block.x - 1) / block.x, (r + block.y - 1) / block.y};
 
-    thrust::generate(thrust::host, h_in.begin(), h_in.end(), gen);
+    thrust::fill(d_out.begin(), d_out.end(), 0.0f);
+    transposeNaive<<<grid, block>>>(d_in.data().get(), c, r, d_out.data().get());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    h_out = d_out;
+    std::printf("transposeNaive: ");
+    checkResult(h_in, r, c, h_out);
 
-    thrust::device_vector<float> d_in1 = h_in;
+    thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
+    constexpr int kPad = 1;
+    transpose<<<grid, block, (block.x + kPad) * block.y * sizeof(float)>>>(
+            d_in.data().get(), c, r, d_out.data().get());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    h_out = d_out;
+    std::printf("transpose: ");
+    checkResult(h_in, r, c, h_out);
 
-    using Clock = std::chrono::high_resolution_clock;
+    thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
 
-    auto start = Clock::now();
-    for (int dup = 0; dup < 100; ++dup)
-    {
-        scan1<<<1, 1>>>(d_in1.data().get(), c, r);
-    }
-    cudaDeviceSynchronize();
-    auto end = Clock::now();
-    printf("scan1 x1000 took %ld ms.\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
-
-    thrust::host_vector<float> h_out1 = d_in1;
-
-    thrust::device_vector<float> d_in2 = h_in;
-
-    start = Clock::now();
-    for (int dup = 0; dup < 100; ++dup)
-    {
-        thrust::device_vector<float> d_temp(rc);
-        scan2<<<1, 1>>>(d_in2.data().get(), d_temp.data().get(), c, r);
-    }
-    cudaDeviceSynchronize();
-    end = Clock::now();
-    printf("scan2 x1000 took %ld ms.\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
-
-    thrust::host_vector<float> h_out2 = d_in2;
-
-//    for (int i = 0; i < r * c; ++i)
-//    {
-//        if (1e-6f < std::abs(h_out1[i] - h_out2[i]))
-//        {
-//            printf("WRONG!\n");
-//            break;
-//        }
-//    }
-//
-//    for (int i = 0; i < r; ++i)
-//    {
-//        for (int j = 0; j < c; ++j)
-//        {
-//            std::printf("%+4.2f ", h_out1[i * c + j]);
-//        }
-//
-//        std::printf("\n");
-//    }
-//
-//    std::printf("\n");
-//
-//    for (int i = 0; i < r; ++i)
-//    {
-//        for (int j = 0; j < c; ++j)
-//        {
-//            std::printf("%+4.2f ", h_out2[i * c + j]);
-//        }
-//
-//        std::printf("\n");
-//    }
-//
-//    std::printf("\n");
+    constexpr int kNItems = 4;
+    transposeUnroll<kPad, kNItems><<<grid, block, (block.x * kNItems + kPad) * block.y * sizeof(float)>>>(
+            d_in.data().get(), c, r, d_out.data().get());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    h_out = d_out;
+    std::printf("transposeUnroll: ");
+    checkResult(h_in, r, c, h_out);
 
     return EXIT_SUCCESS;
 }
 
 /*
+# Profile gld_throughput, gld_efficiency, gst_throughput and gst_efficiency.
 ncu -k regex:transpose --metrics \
 l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum.per_second,\
 l1tex__t_bytes_pipe_lsu_mem_global_op_st.sum.per_second,\
 smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct,\
 smsp__sass_average_data_bytes_per_sector_mem_global_op_st.pct \
 ./cmake-build-release/demo
+
+# Profile all common metrics.
+ncu -k regex:transpose ./cmake-build-release/demo
+
+# For runtime profiling.
+nvprof ./cmake-build-release/demo
 */

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -90,6 +91,41 @@ __global__ void transpose(const float * __restrict__ in, int nx, int ny, float *
 }
 
 
+template <int kPadding = 1, int kNItems = 1>
+__global__ void transposeUnroll(const float * __restrict__ in, int nx, int ny, float * __restrict__ out)
+{
+    extern __shared__ float smem[];
+
+    unsigned ix = blockIdx.x * (blockDim.x * kNItems) + threadIdx.x;
+    unsigned iy = blockIdx.y * blockDim.y + threadIdx.y;
+    unsigned from = iy * nx + ix;
+    unsigned s = threadIdx.y * (blockDim.x * kNItems + kPadding) + threadIdx.x;
+
+    #pragma unroll
+    for (int u = 0; u < kNItems && ix + blockDim.x * u < nx && iy < ny; ++u)
+    {
+        smem[s + blockDim.x * u] = in[from + blockDim.x * u];
+    }
+
+    __syncthreads();
+
+    unsigned t = threadIdx.y * blockDim.x + threadIdx.x;
+    unsigned sx = t / blockDim.y;
+    unsigned sy = t % blockDim.y;
+    s = sy * (blockDim.x * kNItems + kPadding) + sx;
+
+    ix = blockIdx.y * blockDim.y + sy;
+    iy = blockIdx.x * (blockDim.x * kNItems) + sx;
+    unsigned to = iy * ny + ix;
+
+    #pragma unroll
+    for (int u = 0; u < kNItems && ix < ny && iy + blockDim.x * u < nx; ++u)
+    {
+        out[to + ny * blockDim.x * u] = smem[s + blockDim.x * u];
+    }
+}
+
+
 void print(const thrust::host_vector<float> & in, int r, int c, const thrust::host_vector<float> & out)
 {
     for (int i = 0; i < r; ++i)
@@ -120,6 +156,10 @@ void print(const thrust::host_vector<float> & in, int r, int c, const thrust::ho
 
 void checkResult(const thrust::host_vector<float> & in, int r, int c, const thrust::host_vector<float> & out)
 {
+    #ifndef NDEBUG
+    print(in, r, c, out);
+    #endif
+
     bool resultIsCorrect = true;
 
     for (int i = 0, shouldBreak = false; !shouldBreak && i < r; ++i)
@@ -135,17 +175,13 @@ void checkResult(const thrust::host_vector<float> & in, int r, int c, const thru
     }
 
     std::printf("Result is %s\n\n", resultIsCorrect ? "correct." : "WRONG!!!");
-
-    #ifndef NDEBUG
-    print(in, r, c, out);
-    #endif
 }
 
 
 int main(int argc, char * argv[])
 {
-    constexpr int r = 2997;
-    constexpr int c = 1993;
+    constexpr int r = 21027;
+    constexpr int c = 10149;
     constexpr int rc = r * c;
     thrust::host_vector<float> h_in(rc);
     std::iota(h_in.begin(), h_in.end(), 0.0f);
@@ -160,24 +196,43 @@ int main(int argc, char * argv[])
     transposeNaive<<<grid, block>>>(d_in.data().get(), c, r, d_out.data().get());
     CUDA_CHECK(cudaDeviceSynchronize());
     h_out = d_out;
+    std::printf("transposeNaive: ");
     checkResult(h_in, r, c, h_out);
 
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
     constexpr int kPad = 1;
-    transpose<kPad><<<grid, block, (block.x + kPad) * block.y * sizeof(float)>>>(
+    transpose<<<grid, block, (block.x + kPad) * block.y * sizeof(float)>>>(
             d_in.data().get(), c, r, d_out.data().get());
     CUDA_CHECK(cudaDeviceSynchronize());
     h_out = d_out;
+    std::printf("transpose: ");
+    checkResult(h_in, r, c, h_out);
+
+    thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
+
+    constexpr int kNItems = 4;
+    transposeUnroll<kPad, kNItems><<<grid, block, (block.x * kNItems + kPad) * block.y * sizeof(float)>>>(
+            d_in.data().get(), c, r, d_out.data().get());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    h_out = d_out;
+    std::printf("transposeUnroll: ");
     checkResult(h_in, r, c, h_out);
 
     return EXIT_SUCCESS;
 }
 
 /*
+# Profile gld_throughput, gld_efficiency, gst_throughput and gst_efficiency.
 ncu -k regex:transpose --metrics \
 l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum.per_second,\
 l1tex__t_bytes_pipe_lsu_mem_global_op_st.sum.per_second,\
 smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct,\
 smsp__sass_average_data_bytes_per_sector_mem_global_op_st.pct \
 ./cmake-build-release/demo
+
+# Profile all common metrics.
+ncu -k regex:transpose ./cmake-build-release/demo
+
+# For runtime profiling.
+nvprof ./cmake-build-release/demo
 */
