@@ -178,8 +178,8 @@ void checkResult(const thrust::host_vector<float> & in, int r, int c, const thru
 
 int main(int argc, char * argv[])
 {
-    constexpr int r = 2091;
-    constexpr int c = 1134;
+    constexpr int r = 22091;
+    constexpr int c = 19134;
     constexpr int rc = r * c;
     thrust::host_vector<float> h_in(rc);
     std::iota(h_in.begin(), h_in.end(), 0.0f);
@@ -190,6 +190,14 @@ int main(int argc, char * argv[])
     constexpr dim3 block = {32, 32};
     dim3 grid = {(c + block.x - 1) / block.x, (r + block.y - 1) / block.y};
 
+    constexpr int kPad = 1;
+    constexpr int kNItems = 2;
+    constexpr int kDup = 100;
+
+    using Clock = std::chrono::high_resolution_clock;
+    Clock::time_point ss, ee;
+
+    // Naive
     thrust::fill(d_out.begin(), d_out.end(), 0.0f);
     transposeNaive<<<grid, block>>>(d_in.data().get(), c, r, d_out.data().get());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -197,22 +205,34 @@ int main(int argc, char * argv[])
     std::printf("transposeNaive: ");
     checkResult(h_in, r, c, h_out);
 
+    // Regular
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
-    constexpr int kPad = 1;
-    transpose<kPad><<<grid, block, (block.x + kPad) * block.y * sizeof(float)>>>(
+    ss = Clock::now();
+    for (int dup = 0; dup < kDup; ++dup)
+    {
+        transpose<kPad><<<grid, block, (block.x + kPad) * block.y * sizeof(float)>>>(
             d_in.data().get(), c, r, d_out.data().get());
-    CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    ee = Clock::now();
     h_out = d_out;
     std::printf("transpose: ");
+    std::printf("took %f ms, ", std::chrono::duration_cast<std::chrono::microseconds>(ee - ss).count() * 1e-3f);
     checkResult(h_in, r, c, h_out);
 
+    // Unroll
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
-    constexpr int kNItems = 2;
-    transposeUnroll<kNItems, kPad><<<grid, block, (block.x * kNItems + kPad) * block.y * sizeof(float)>>>(
-            d_in.data().get(), c, r, d_out.data().get());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    ss = Clock::now();
+    for (int dup = 0; dup < kDup; ++dup)
+    {
+        transposeUnroll<kNItems, kPad><<<grid, block, (block.x * kNItems + kPad) * block.y * sizeof(float)>>>(
+                d_in.data().get(), c, r, d_out.data().get());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    ee = Clock::now();
     h_out = d_out;
     std::printf("transposeUnroll: ");
+    std::printf("took %f ms, ", std::chrono::duration_cast<std::chrono::microseconds>(ee - ss).count() * 1e-3f);
     checkResult(h_in, r, c, h_out);
 
     return EXIT_SUCCESS;
