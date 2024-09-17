@@ -123,6 +123,7 @@ __global__ void transposeUnroll(const T * __restrict__ in, int nx, int ny, T * _
     }
 }
 
+
 void print(const thrust::host_vector<float> & in, int r, int c, const thrust::host_vector<float> & out)
 {
     for (int i = 0; i < r; ++i)
