@@ -102,7 +102,6 @@ __global__ void transposeUnroll(const float * __restrict__ in, int nx, int ny, f
         smem[s + blockDim.x * u] = in[from + blockDim.x * u];
 
         #ifndef NDEBUG
-
         if (blockIdx.x == 0 && blockIdx.y == 0)
         {
             printf("t%u%u smem[%u] <- in[%u] (%f)\n",
@@ -127,9 +126,6 @@ __global__ void transposeUnroll(const float * __restrict__ in, int nx, int ny, f
     #pragma unroll
     for (int u = 0; u < kNItems && ix < ny && iy + blockDim.x * u < nx; ++u)
     {
-        // The next element-to-write for this thread spans blockDim.x * blockDim.y elements (row-major)
-        // in the output block (of x size blockDim.y, y size blockDim.x), i.e., blockDim.x rows.
-        // The row-major index in output array spans by blockDim.x * ny.
         out[to + ny * blockDim.x * u] = smem[s + blockDim.x * u];
 
         #ifndef NDEBUG
