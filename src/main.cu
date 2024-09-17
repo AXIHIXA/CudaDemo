@@ -13,7 +13,8 @@
 #include "utils/cuda_utils.h"
 
 
-__global__ void transposeNaive(const float * __restrict__ in, int nx, int ny, float * __restrict__ out)
+template <typename T>
+__global__ void transposeNaive(const T * __restrict__ in, int nx, int ny, T * __restrict__ out)
 {
     unsigned x = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -37,10 +38,10 @@ __global__ void transposeNaive(const float * __restrict__ in, int nx, int ny, fl
 /// margin (remainder) elements will be read by in-bound threads
 /// (with these in-bound threads write NOTHING)
 /// but written by out-of-bound threads!
-template <int kPadding = 1>
-__global__ void transpose(const float * __restrict__ in, int nx, int ny, float * __restrict__ out)
+template <int kPadding = 1, typename T>
+__global__ void transpose(const T * __restrict__ in, int nx, int ny, T * __restrict__ out)
 {
-    extern __shared__ float smem[];  // smem[blockDim.y][blockDim.x + kPadding].
+    extern __shared__ T smem[];  // smem[blockDim.y][blockDim.x + kPadding].
 
     unsigned ix = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned iy = blockIdx.y * blockDim.y + threadIdx.y;
@@ -76,7 +77,8 @@ __global__ void transpose(const float * __restrict__ in, int nx, int ny, float *
 /// "Row unroll":
 /// Each thread block is "duplicated" for kNItems times along the x-dimension.
 /// Threads first do what they do in the "original block",
-/// then they move to the next block and do what they do in that area.
+/// then they translate/slide to the next block and do what they do in that area.
+/// The x-coordinate offsets by blockDim.x.
 ///
 /// E.g.
 /// [[ 0  1  2  3  4  5  6  7],
@@ -86,12 +88,12 @@ __global__ void transpose(const float * __restrict__ in, int nx, int ny, float *
 /// then load [2, 3, 9, 10].
 /// For sequential loads in for loop, each thread simply offset x coordinate by blockDim.x.
 /// Smem index also offsets by blockDim.x. (The padding does not affect here as we don't cross rows.)
-template <int kPadding = 1, int kNItems = 1>
-__global__ void transposeUnroll(const float * __restrict__ in, int nx, int ny, float * __restrict__ out)
+template <int kNItems = 1, int kPadding = 1, typename T>
+__global__ void transposeUnroll(const T * __restrict__ in, int nx, int ny, T * __restrict__ out)
 {
-    extern __shared__ float smem[];
+    extern __shared__ T smem[];
 
-    unsigned ix = blockIdx.x * (blockDim.x * kNItems) + threadIdx.x;
+    unsigned ix = blockIdx.x * blockDim.x * kNItems + threadIdx.x;
     unsigned iy = blockIdx.y * blockDim.y + threadIdx.y;
     unsigned from = iy * nx + ix;
     unsigned s = threadIdx.y * (blockDim.x * kNItems + kPadding) + threadIdx.x;
@@ -100,15 +102,6 @@ __global__ void transposeUnroll(const float * __restrict__ in, int nx, int ny, f
     for (int u = 0; u < kNItems && ix + blockDim.x * u < nx && iy < ny; ++u)
     {
         smem[s + blockDim.x * u] = in[from + blockDim.x * u];
-
-        #ifndef NDEBUG
-        if (blockIdx.x == 0 && blockIdx.y == 0)
-        {
-            printf("t%u%u smem[%u] <- in[%u] (%f)\n",
-                   threadIdx.y, threadIdx.x,
-                   s + blockDim.x * u, from + blockDim.x * u, in[from + blockDim.x * u]);
-        }
-        #endif  // NDEBUG
     }
 
     __syncthreads();
@@ -116,29 +109,19 @@ __global__ void transposeUnroll(const float * __restrict__ in, int nx, int ny, f
     // t is the INDEX of this thread in block, not index of its first element!
     unsigned t = threadIdx.y * blockDim.x + threadIdx.x;
     unsigned sx = t / blockDim.y;
-    unsigned sy = t % blockDim.y;
+    unsigned sy = t % blockDim.x;
     s = sy * (blockDim.x * kNItems + kPadding) + sx;
 
     ix = blockIdx.y * blockDim.y + sy;
-    iy = blockIdx.x * (blockDim.x * kNItems) + sx;
+    iy = blockIdx.x * blockDim.x * kNItems + sx;
     unsigned to = iy * ny + ix;
 
     #pragma unroll
     for (int u = 0; u < kNItems && ix < ny && iy + blockDim.x * u < nx; ++u)
     {
         out[to + ny * blockDim.x * u] = smem[s + blockDim.x * u];
-
-        #ifndef NDEBUG
-        if (blockIdx.x == 0 && blockIdx.y == 0)
-        {
-            printf("t%u%u out[%u] <- smem[%u] (%f)\n",
-                   threadIdx.y, threadIdx.x,
-                   to + ny * blockDim.x * u, s + blockDim.x * u, smem[s + blockDim.x * u]);
-        }
-        #endif  // NDEBUG
     }
 }
-
 
 void print(const thrust::host_vector<float> & in, int r, int c, const thrust::host_vector<float> & out)
 {
@@ -194,8 +177,8 @@ void checkResult(const thrust::host_vector<float> & in, int r, int c, const thru
 
 int main(int argc, char * argv[])
 {
-    constexpr int r = 4;
-    constexpr int c = 8;
+    constexpr int r = 2091;
+    constexpr int c = 1134;
     constexpr int rc = r * c;
     thrust::host_vector<float> h_in(rc);
     std::iota(h_in.begin(), h_in.end(), 0.0f);
@@ -203,7 +186,7 @@ int main(int argc, char * argv[])
     thrust::device_vector<float> d_out(rc);
     thrust::host_vector<float> h_out;
 
-    constexpr dim3 block = {2, 2};
+    constexpr dim3 block = {32, 32};
     dim3 grid = {(c + block.x - 1) / block.x, (r + block.y - 1) / block.y};
 
     thrust::fill(d_out.begin(), d_out.end(), 0.0f);
@@ -215,7 +198,7 @@ int main(int argc, char * argv[])
 
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
     constexpr int kPad = 1;
-    transpose<<<grid, block, (block.x + kPad) * block.y * sizeof(float)>>>(
+    transpose<kPad><<<grid, block, (block.x + kPad) * block.y * sizeof(float)>>>(
             d_in.data().get(), c, r, d_out.data().get());
     CUDA_CHECK(cudaDeviceSynchronize());
     h_out = d_out;
@@ -224,7 +207,7 @@ int main(int argc, char * argv[])
 
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
     constexpr int kNItems = 2;
-    transposeUnroll<kPad, kNItems><<<grid, block, (block.x * kNItems + kPad) * block.y * sizeof(float)>>>(
+    transposeUnroll<kNItems, kPad><<<grid, block, (block.x * kNItems + kPad) * block.y * sizeof(float)>>>(
             d_in.data().get(), c, r, d_out.data().get());
     CUDA_CHECK(cudaDeviceSynchronize());
     h_out = d_out;
