@@ -157,6 +157,8 @@ __global__ void reduceWithLastWarpUnrolled(const T * __restrict__ in, T * __rest
 template <int kBlockSize, typename T>
 __device__ void blockSmemReduce(volatile T * __restrict__ smem)
 {
+    unsigned tid = threadIdx.x;
+
     #define MANUAL_UNROLL
 
     #ifdef MANUAL_UNROLL
@@ -166,9 +168,9 @@ __device__ void blockSmemReduce(volatile T * __restrict__ smem)
     // Note: Hardware constraint: blockSize is typically at most 1024.
     if (1024 <= kBlockSize)
     {
-        if (threadIdx.x < 512)
+        if (tid < 512)
         {
-            smem[threadIdx.x] += smem[threadIdx.x + 512];
+            smem[tid] += smem[tid + 512];
         }
 
         __syncthreads();
@@ -176,9 +178,9 @@ __device__ void blockSmemReduce(volatile T * __restrict__ smem)
 
     if (512 <= kBlockSize)
     {
-        if (threadIdx.x < 256)
+        if (tid < 256)
         {
-            smem[threadIdx.x] += smem[threadIdx.x + 256];
+            smem[tid] += smem[tid + 256];
         }
 
         __syncthreads();
@@ -186,9 +188,9 @@ __device__ void blockSmemReduce(volatile T * __restrict__ smem)
 
     if (256 <= kBlockSize)
     {
-        if (threadIdx.x < 128)
+        if (tid < 128)
         {
-            smem[threadIdx.x] += smem[threadIdx.x + 128];
+            smem[tid] += smem[tid + 128];
         }
 
         __syncthreads();
@@ -196,9 +198,9 @@ __device__ void blockSmemReduce(volatile T * __restrict__ smem)
 
     if (128 <= kBlockSize)
     {
-        if (threadIdx.x < 64)
+        if (tid < 64)
         {
-            smem[threadIdx.x] += smem[threadIdx.x + 64];
+            smem[tid] += smem[tid + 64];
         }
 
         __syncthreads();
@@ -207,9 +209,9 @@ __device__ void blockSmemReduce(volatile T * __restrict__ smem)
     #pragma unroll
     for (unsigned s = (kBlockSize >> 1); 32 < s; s >>= 1)
     {
-        if (threadIdx.x < s)
+        if (tid < s)
         {
-            smem[threadIdx.x] += smem[threadIdx.x + s];
+            smem[tid] += smem[tid + s];
         }
 
         __syncthreads();
@@ -217,30 +219,30 @@ __device__ void blockSmemReduce(volatile T * __restrict__ smem)
     #endif  // MANUAL_UNROLL
 
     // The final warp unrolled.
-    if (threadIdx.x < 32)
+    if (tid < 32)
     {
         volatile T * __restrict__ vshm = smem;
-        T x = vshm[threadIdx.x];
+        T x = vshm[tid];
 
         // hzw demoed that not explicitly using intermediate register x
         // and not calling __syncwarp() might also work correctly on pre-Volta GPUs.
         // However, this following is recommended by NVIDIA and is guaranteed to be correct!
         if (64 <= blockDim.x)
         {
-            x += vshm[threadIdx.x + 32]; __syncwarp();
-            vshm[threadIdx.x] = x; __syncwarp();
+            x += vshm[tid + 32]; __syncwarp();
+            vshm[tid] = x; __syncwarp();
         }
 
-        x += vshm[threadIdx.x + 16]; __syncwarp();
-        vshm[threadIdx.x] = x; __syncwarp();
-        x += vshm[threadIdx.x + 8]; __syncwarp();
-        vshm[threadIdx.x] = x; __syncwarp();
-        x += vshm[threadIdx.x + 4]; __syncwarp();
-        vshm[threadIdx.x] = x; __syncwarp();
-        x += vshm[threadIdx.x + 2]; __syncwarp();
-        vshm[threadIdx.x] = x; __syncwarp();
-        x += vshm[threadIdx.x + 1]; __syncwarp();
-        vshm[threadIdx.x] = x; __syncwarp();
+        x += vshm[tid + 16]; __syncwarp();
+        vshm[tid] = x; __syncwarp();
+        x += vshm[tid + 8]; __syncwarp();
+        vshm[tid] = x; __syncwarp();
+        x += vshm[tid + 4]; __syncwarp();
+        vshm[tid] = x; __syncwarp();
+        x += vshm[tid + 2]; __syncwarp();
+        vshm[tid] = x; __syncwarp();
+        x += vshm[tid + 1]; __syncwarp();
+        vshm[tid] = x; __syncwarp();
     }
 }
 
