@@ -30,6 +30,7 @@ set(ALL_COMPILE_OPTS
         # -g is default in CMAKE_<LANG>_FLAGS_DEBUG
         $<$<CONFIG:DEBUG>:-O0>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:-G>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:-lineinfo>
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
         $<$<COMPILE_LANGUAGE:CUDA>:--relocatable-device-code=true>
 )
