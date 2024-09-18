@@ -297,6 +297,61 @@ __global__ void reduceGridTranslationFullUnroll(const T * __restrict__ in, int n
 }
 
 
+template <unsigned kBlockSize, typename T>
+__device__ T warpShuffleReduce(T sum)
+{
+    sum += __shfl_down_sync(0xffffffff, sum, 16);
+    sum += __shfl_down_sync(0xffffffff, sum, 8);
+    sum += __shfl_down_sync(0xffffffff, sum, 4);
+    sum += __shfl_down_sync(0xffffffff, sum, 2);
+    sum += __shfl_down_sync(0xffffffff, sum, 1);
+    return sum;
+}
+
+
+template <unsigned kBlockSize, unsigned kWarpSize, typename T>
+__global__ void reduceGridTranslationWarpShuffle(const T * __restrict__ in, int nx, T * __restrict__ out)
+{
+    const unsigned gridSize = gridDim.x;
+    unsigned from = blockIdx.x * kBlockSize + threadIdx.x;
+    unsigned tid = threadIdx.x;
+
+    T sum = 0;
+
+    for (; from < nx; from += gridSize * kBlockSize)
+    {
+        sum += in[from];
+    }
+
+    __shared__ T warpSums[kBlockSize / kWarpSize];
+
+    const int laneIdx = tid % kWarpSize;
+    const int warpIdx = tid / kWarpSize;
+
+    sum = warpShuffleReduce<kBlockSize>(sum);
+
+    if (laneIdx == 0)
+    {
+        warpSums[warpIdx] = sum;
+    }
+
+    __syncthreads();
+
+    sum = (tid < kBlockSize / kWarpSize) ? warpSums[laneIdx] : 0;
+
+    // Final reduce using the first warp.
+    if (warpIdx == 0)
+    {
+        sum = warpShuffleReduce<kBlockSize / kWarpSize>(sum);
+    }
+
+    if (tid == 0)
+    {
+        out[blockIdx.x] = sum;
+    }
+}
+
+
 void checkResult(const thrust::device_vector<float> & in, const thrust::host_vector<float> & out)
 {
     float res = thrust::reduce(out.cbegin(), out.cend());
@@ -474,8 +529,52 @@ int main(int argc, char * argv[])
     std::printf("took %f ms, ", ms / kDup);
     checkResult(d_in, h_out);
 
+    // Warp shuffle reduction.
+    #ifdef NDEBUG
+    reduceGridTranslationWarpShuffle<block.x, 32><<<grid, block.x>>>(
+        d_in.data().get(), n, d_out.data().get()
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+    #endif  // NDEBUG
+
+    thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
+    CUDA_CHECK(cudaEventRecord(ss));
+
+    for (int dup = 0; dup < kDup; ++dup)
+    {
+        reduceGridTranslationWarpShuffle<block.x, 32><<<grid, block.x>>>(
+            d_in.data().get(), n, d_out.data().get()
+        );
+    }
+
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaEventRecord(ee));
+    CUDA_CHECK(cudaEventSynchronize(ee));
+
+    h_out = d_out;
+    std::printf("reduceGridTranslationWarpShuffle: ");
+    CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
+    std::printf("took %f ms, ", ms / kDup);
+    checkResult(d_in, h_out);
+
+    // Free cuda events.
     cudaEventDestroy(ss);
     cudaEventDestroy(ee);
 
     return EXIT_SUCCESS;
 }
+
+/*
+reduceNaive: took 0.678995 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+
+reduceFatBlock: took 0.307825 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+
+reduceFullUnroll: took 0.203378 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+
+reduceWithLastWarpUnrolled: took 0.201694 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+
+reduceGridTranslationFullUnroll: took 0.364502 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+
+reduceGridTranslationWarpShuffle: took 0.289932 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+*/
