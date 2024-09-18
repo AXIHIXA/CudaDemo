@@ -297,7 +297,7 @@ __global__ void reduceGridTranslationFullUnroll(const T * __restrict__ in, int n
 }
 
 
-template <unsigned kBlockSize, typename T>
+template <typename T>
 __device__ T warpShuffleReduce(T sum)
 {
     sum += __shfl_down_sync(0xffffffff, sum, 16);
@@ -328,7 +328,7 @@ __global__ void reduceGridTranslationWarpShuffle(const T * __restrict__ in, int 
     const int laneIdx = tid % kWarpSize;
     const int warpIdx = tid / kWarpSize;
 
-    sum = warpShuffleReduce<kBlockSize>(sum);
+    sum = warpShuffleReduce(sum);
 
     if (laneIdx == 0)
     {
@@ -342,7 +342,7 @@ __global__ void reduceGridTranslationWarpShuffle(const T * __restrict__ in, int 
     // Final reduce using the first warp.
     if (warpIdx == 0)
     {
-        sum = warpShuffleReduce<kBlockSize / kWarpSize>(sum);
+        sum = warpShuffleReduce(sum);
     }
 
     if (tid == 0)
@@ -566,15 +566,15 @@ int main(int argc, char * argv[])
 }
 
 /*
-reduceNaive: took 0.678995 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+reduceNaive: took 0.471717 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
 
-reduceFatBlock: took 0.307825 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+reduceFatBlock: took 0.222054 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
 
-reduceFullUnroll: took 0.203378 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+reduceFullUnroll: took 0.186880 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
 
-reduceWithLastWarpUnrolled: took 0.201694 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+reduceWithLastWarpUnrolled: took 0.181041 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
 
-reduceGridTranslationFullUnroll: took 0.364502 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+reduceGridTranslationFullUnroll: took 0.364141 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
 
-reduceGridTranslationWarpShuffle: took 0.289932 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+reduceGridTranslationWarpShuffle: took 0.289644 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
 */
