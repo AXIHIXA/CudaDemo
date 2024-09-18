@@ -74,6 +74,7 @@ __global__ void transpose(const T * __restrict__ in, int nx, int ny, T * __restr
 }
 
 
+/// WARNING: Unrolling does not guarantee better performace! Performance may degrade!
 /// "Row unroll":
 /// Each thread block is "duplicated" for kNItems times along the x-dimension.
 /// Threads first do what they do in the "original block",
@@ -98,10 +99,15 @@ __global__ void transposeUnroll(const T * __restrict__ in, int nx, int ny, T * _
     unsigned from = iy * nx + ix;
     unsigned s = threadIdx.y * (blockDim.x * kNItems + kPadding) + threadIdx.x;
 
+    // #pragma unroll requires trip count be constant!
+    // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#pragma-unroll
     #pragma unroll
-    for (int u = 0; u < kNItems && ix + blockDim.x * u < nx && iy < ny; ++u)
+    for (int u = 0; u < kNItems; ++u)
     {
-        smem[s + blockDim.x * u] = in[from + blockDim.x * u];
+        if (ix + blockDim.x * u < nx && iy < ny)
+        {
+            smem[s + blockDim.x * u] = in[from + blockDim.x * u];
+        }
     }
 
     __syncthreads();
@@ -117,9 +123,12 @@ __global__ void transposeUnroll(const T * __restrict__ in, int nx, int ny, T * _
     unsigned to = iy * ny + ix;
 
     #pragma unroll
-    for (int u = 0; u < kNItems && ix < ny && iy + blockDim.x * u < nx; ++u)
+    for (int u = 0; u < kNItems; ++u)
     {
-        out[to + ny * blockDim.x * u] = smem[s + blockDim.x * u];
+        if (ix < ny && iy + blockDim.x * u < nx)
+        {
+            out[to + ny * blockDim.x * u] = smem[s + blockDim.x * u];
+        }
     }
 }
 
@@ -178,8 +187,8 @@ void checkResult(const thrust::host_vector<float> & in, int r, int c, const thru
 
 int main(int argc, char * argv[])
 {
-    constexpr int r = 22091;
-    constexpr int c = 19134;
+    constexpr int r = 4096;
+    constexpr int c = 2048;
     constexpr int rc = r * c;
     thrust::host_vector<float> h_in(rc);
     std::iota(h_in.begin(), h_in.end(), 0.0f);
@@ -207,13 +216,16 @@ int main(int argc, char * argv[])
 
     // Regular
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
+    transpose<kPad><<<grid, block, (block.x + kPad) * block.y * sizeof(float)>>>(
+            d_in.data().get(), c, r, d_out.data().get());
+    CUDA_CHECK(cudaDeviceSynchronize());
     ss = Clock::now();
     for (int dup = 0; dup < kDup; ++dup)
     {
         transpose<kPad><<<grid, block, (block.x + kPad) * block.y * sizeof(float)>>>(
             d_in.data().get(), c, r, d_out.data().get());
-        CUDA_CHECK(cudaDeviceSynchronize());
     }
+    CUDA_CHECK(cudaDeviceSynchronize());
     ee = Clock::now();
     h_out = d_out;
     std::printf("transpose: ");
@@ -222,13 +234,16 @@ int main(int argc, char * argv[])
 
     // Unroll
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
+    transposeUnroll<kNItems, kPad><<<grid, block, (block.x * kNItems + kPad) * block.y * sizeof(float)>>>(
+                d_in.data().get(), c, r, d_out.data().get());
+    CUDA_CHECK(cudaDeviceSynchronize());
     ss = Clock::now();
     for (int dup = 0; dup < kDup; ++dup)
     {
         transposeUnroll<kNItems, kPad><<<grid, block, (block.x * kNItems + kPad) * block.y * sizeof(float)>>>(
                 d_in.data().get(), c, r, d_out.data().get());
-        CUDA_CHECK(cudaDeviceSynchronize());
     }
+    CUDA_CHECK(cudaDeviceSynchronize());
     ee = Clock::now();
     h_out = d_out;
     std::printf("transposeUnroll: ");
