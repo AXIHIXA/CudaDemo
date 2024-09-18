@@ -196,12 +196,17 @@ int main(int argc, char * argv[])
     thrust::device_vector<float> d_out(rc);
     thrust::host_vector<float> h_out;
 
+    #ifdef NDEBUG
+    constexpr int kDup = 100;
+    #else
+    constexpr int kDup = 1;
+    #endif  // NDEBUG
+
     constexpr dim3 block = {32, 32};
     dim3 grid = {(c + block.x - 1) / block.x, (r + block.y - 1) / block.y};
 
     constexpr int kPad = 1;
     constexpr int kNItems = 2;
-    constexpr int kDup = 100;
 
     using Clock = std::chrono::high_resolution_clock;
     Clock::time_point ss, ee;

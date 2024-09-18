@@ -16,13 +16,13 @@
 template <typename T>
 __global__ void transposeNaive(const T * __restrict__ in, int nx, int ny, T * __restrict__ out)
 {
-    unsigned x = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned y = blockIdx.y * blockDim.y + threadIdx.y;
+    unsigned ix = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned iy = blockIdx.y * blockDim.y + threadIdx.y;
+    unsigned from = iy * nx + ix;
+    unsigned to = ix * ny + iy;
 
-    if (x < nx && y < ny)
+    if (ix < nx && iy < ny)
     {
-        unsigned from = y * nx + x;
-        unsigned to = x * ny + y;
         out[to] = in[from];
     }
 }
@@ -134,43 +134,77 @@ int main(int argc, char * argv[])
     thrust::device_vector<float> d_out(rc);
     thrust::host_vector<float> h_out;
 
-    constexpr int kPad = 1;
+    #ifdef NDEBUG
     constexpr int kDup = 100;
+    #else
+    constexpr int kDup = 1;
+    #endif  // NDEBUG
+
+    constexpr int kPadding = 1;
     constexpr dim3 block = {32, 32};
     dim3 grid = {(c + block.x - 1) / block.x, (r + block.y - 1) / block.y};
 
-    using Clock = std::chrono::high_resolution_clock;
-    Clock::time_point ss, ee;
+    float ms;
+    cudaEvent_t ss;
+    cudaEvent_t ee;
+    CUDA_CHECK(cudaEventCreate(&ss));
+    CUDA_CHECK(cudaEventCreate(&ee));
 
     // Naive
+    #ifdef NDEBUG
     transposeNaive<<<grid, block>>>(d_in.data().get(), c, r, d_out.data().get());
+    CUDA_CHECK_LAST_ERROR();
     CUDA_CHECK(cudaDeviceSynchronize());
+    #endif  // NDEBUG
+
     thrust::fill(d_out.begin(), d_out.end(), 0.0f);
-    ss = Clock::now();
+    CUDA_CHECK(cudaEventRecord(ss));
+
     for (int dup = 0; dup < kDup; ++dup)
-    transposeNaive<<<grid, block>>>(d_in.data().get(), c, r, d_out.data().get());
+    {
+        transposeNaive<<<grid, block>>>(d_in.data().get(), c, r, d_out.data().get());
+    }
+
+    CUDA_CHECK_LAST_ERROR();
     CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaEventRecord(ee));
+    CUDA_CHECK(cudaEventSynchronize(ee));
+
     h_out = d_out;
-    ee = Clock::now();
     std::printf("transposeNaive: ");
-    std::printf("took %f ms, ", std::chrono::duration_cast<std::chrono::microseconds>(ee - ss).count() * 1e-3f);
+    CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
+    std::printf("took %f ms, ", ms / kDup);
     checkResult(h_in, r, c, h_out);
 
     // Regular
-    transpose<kPad><<<grid, block, (block.x + kPad) * block.y * sizeof(float)>>>(
+    #ifdef NDEBUG
+    transpose<kPadding><<<grid, block, (block.x + kPadding) * block.y * sizeof(float)>>>(
         d_in.data().get(), c, r, d_out.data().get());
+    CUDA_CHECK_LAST_ERROR();
     CUDA_CHECK(cudaDeviceSynchronize());
+    #endif  // NDEBUG
+
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
-    ss = Clock::now();
+    CUDA_CHECK(cudaEventRecord(ss));
+
     for (int dup = 0; dup < kDup; ++dup)
-    transpose<kPad><<<grid, block, (block.x + kPad) * block.y * sizeof(float)>>>(
-        d_in.data().get(), c, r, d_out.data().get());
+    {
+        transpose<kPadding><<<grid, block, (block.x + kPadding) * block.y * sizeof(float)>>>(
+            d_in.data().get(), c, r, d_out.data().get());
+    }
+
+    CUDA_CHECK_LAST_ERROR();
     CUDA_CHECK(cudaDeviceSynchronize());
-    ee = Clock::now();
+    CUDA_CHECK(cudaEventRecord(ee));
+    CUDA_CHECK(cudaEventSynchronize(ee));
+
     h_out = d_out;
-    std::printf("transpose: ");
-    std::printf("took %f ms, ", std::chrono::duration_cast<std::chrono::microseconds>(ee - ss).count() * 1e-3f);
+    CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
+    std::printf("took %f ms, ", ms / kDup);
     checkResult(h_in, r, c, h_out);
+
+    CUDA_CHECK(cudaEventDestroy(ss));
+    CUDA_CHECK(cudaEventDestroy(ee));
 
     return EXIT_SUCCESS;
 }

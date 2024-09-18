@@ -80,8 +80,8 @@ __global__ void reduceFatBlock(const T * __restrict__ in, T * __restrict__ out)
 
 /// Recommended way to implement warp-wide reduction by NVIDIA.
 /// Ensure load/store order and result correctness by synchronization primitives.
-template <typename T>
-__device__ void warpSmemReduce(volatile T * __restrict__ smem, unsigned tid)
+template <unsigned kBlockSize, typename T>
+__device__ void warpSmemReduce(volatile T * __restrict__ smem)
 {
     // There's risk of data race (and writes/loads being optimized out) on smem:
     // E.g., smem[tid] += smem[tid + 16] ==> t0: smem[0] += smem[16]; t16: smem[16] += smem[32].
@@ -99,9 +99,10 @@ __device__ void warpSmemReduce(volatile T * __restrict__ smem, unsigned tid)
     // If a variable located in global or shared memory is declared as volatile,
     // the compiler assumes that its value can be changed or used at any time by another thread
     // and therefore any reference to this variable compiles to an actual memory read or write instruction.
+    unsigned tid = threadIdx.x;
     T x = smem[tid];
 
-    if (64 <= blockDim.x)
+    if (64 <= kBlockSize)
     {
         x += smem[tid + 32]; __syncwarp();
         smem[tid] = x; __syncwarp();
@@ -120,18 +121,18 @@ __device__ void warpSmemReduce(volatile T * __restrict__ smem, unsigned tid)
 }
 
 
-template <int kBlockSize, typename T>
+template <unsigned kBlockSize, typename T>
 __global__ void reduceWithLastWarpUnrolled(const T * __restrict__ in, T * __restrict__ out)
 {
     __shared__ T smem[kBlockSize];
 
-    unsigned ix = blockIdx.x * kBlockSize * 2 + threadIdx.x;
     unsigned tid = threadIdx.x;
+    unsigned from = blockIdx.x * kBlockSize * 2 + threadIdx.x;
 
-    smem[tid] = in[ix] + in[ix + kBlockSize];
+    smem[tid] = in[from] + in[from + kBlockSize];
     __syncthreads();
 
-    for (unsigned s = (blockDim.x >> 1); 32 < s; s >>= 1)
+    for (unsigned s = kBlockSize >> 1; 32 < s; s >>= 1)
     {
         if (tid < s)
         {
@@ -141,10 +142,9 @@ __global__ void reduceWithLastWarpUnrolled(const T * __restrict__ in, T * __rest
         __syncthreads();
     }
 
-    // Reduce the last warp.
     if (tid < 32)
     {
-        warpSmemReduce(smem, tid);
+        warpSmemReduce<kBlockSize>(smem);
     }
 
     if (tid == 0)
@@ -157,9 +157,13 @@ __global__ void reduceWithLastWarpUnrolled(const T * __restrict__ in, T * __rest
 template <int kBlockSize, typename T>
 __device__ void blockSmemReduce(volatile T * __restrict__ smem)
 {
+    #define MANUAL_UNROLL
+
+    #ifdef MANUAL_UNROLL
     // Completely unroll the for loop,
     // wiping out addition instructions in for updates,
     // and offering compiler with more freedom for reordering.
+    // Note: Hardware constraint: blockSize is typically at most 1024.
     if (1024 <= kBlockSize)
     {
         if (threadIdx.x < 512)
@@ -199,44 +203,57 @@ __device__ void blockSmemReduce(volatile T * __restrict__ smem)
 
         __syncthreads();
     }
-
-    // The final warp.
-    if (threadIdx.x < 32)
+    #else
+    #pragma unroll
+    for (unsigned s = (kBlockSize >> 1); 32 < s; s >>= 1)
     {
-        volatile float * vshm = smem;
-
-        if (64 <= blockDim.x)
+        if (threadIdx.x < s)
         {
-            vshm[threadIdx.x] += vshm[threadIdx.x + 32];
+            smem[threadIdx.x] += smem[threadIdx.x + s];
         }
 
-        vshm[threadIdx.x] += vshm[threadIdx.x + 16];
-        vshm[threadIdx.x] += vshm[threadIdx.x + 8];
-        vshm[threadIdx.x] += vshm[threadIdx.x + 4];
-        vshm[threadIdx.x] += vshm[threadIdx.x + 2];
-        vshm[threadIdx.x] += vshm[threadIdx.x + 1];
+        __syncthreads();
     }
+    #endif  // MANUAL_UNROLL
 
+    // The final warp unrolled.
+    if (threadIdx.x < 32)
+    {
+        volatile T * __restrict__ vshm = smem;
+        T x = vshm[threadIdx.x];
+
+        // hzw demoed that not explicitly using intermediate register x
+        // and not calling __syncwarp() might also work correctly on pre-Volta GPUs.
+        // However, this following is recommended by NVIDIA and is guaranteed to be correct!
+        if (64 <= blockDim.x)
+        {
+            x += vshm[threadIdx.x + 32]; __syncwarp();
+            vshm[threadIdx.x] = x; __syncwarp();
+        }
+
+        x += vshm[threadIdx.x + 16]; __syncwarp();
+        vshm[threadIdx.x] = x; __syncwarp();
+        x += vshm[threadIdx.x + 8]; __syncwarp();
+        vshm[threadIdx.x] = x; __syncwarp();
+        x += vshm[threadIdx.x + 4]; __syncwarp();
+        vshm[threadIdx.x] = x; __syncwarp();
+        x += vshm[threadIdx.x + 2]; __syncwarp();
+        vshm[threadIdx.x] = x; __syncwarp();
+        x += vshm[threadIdx.x + 1]; __syncwarp();
+        vshm[threadIdx.x] = x; __syncwarp();
+    }
 }
 
 
 template <int kBlockSize, typename T>
-__global__ void reduceFullUnroll(const T * __restrict__ in, unsigned nx, T * __restrict__ out)
+__global__ void reduceFullUnroll(const T * __restrict__ in, T * __restrict__ out)
 {
     __shared__ T smem[kBlockSize];
 
-    unsigned ix = blockIdx.x * kBlockSize + threadIdx.x;
+    unsigned from = blockIdx.x * kBlockSize * 2 + threadIdx.x;
     unsigned tid = threadIdx.x;
-    unsigned totalNumberOfthreads = kBlockSize * gridDim.x;
 
-    T sum = 0;
-
-    for (unsigned i = ix; i < nx; i += totalNumberOfthreads)
-    {
-        sum += in[i];
-    }
-
-    smem[tid] = sum;
+    smem[tid] = in[from] + in[from + kBlockSize];
     __syncthreads();
 
     blockSmemReduce<kBlockSize>(smem);
@@ -262,7 +279,6 @@ int main(int argc, char * argv[])
     thrust::host_vector<float> h_in(n, 1.0f);
     thrust::device_vector<float> d_in = h_in;
     thrust::device_vector<float> d_out(n, 0.0f);
-    thrust::device_vector<float> d_part_out(n, 0.0f);
     thrust::host_vector<float> h_out;
 
     #ifdef NDEBUG
@@ -311,7 +327,7 @@ int main(int argc, char * argv[])
     // Fat block
     #ifdef NDEBUG
     reduceFatBlock<(block.x >> 1)><<<grid, block.x >> 1>>>(
-            d_in.data().get(), d_out.data().get()
+        d_in.data().get(), d_out.data().get()
     );
     CUDA_CHECK(cudaDeviceSynchronize());
     #endif  // NDEBUG
@@ -322,7 +338,7 @@ int main(int argc, char * argv[])
     for (int dup = 0; dup < kDup; ++dup)
     {
         reduceFatBlock<(block.x >> 1)><<<grid, block.x >> 1>>>(
-                d_in.data().get(), d_out.data().get()
+            d_in.data().get(), d_out.data().get()
         );
     }
 
@@ -340,7 +356,7 @@ int main(int argc, char * argv[])
     // Last warp as unrolled warp-wide reduction.
     #ifdef NDEBUG
     reduceWithLastWarpUnrolled<(block.x >> 1)><<<grid, block.x >> 1>>>(
-            d_in.data().get(), d_out.data().get()
+        d_in.data().get(), d_out.data().get()
     );
     CUDA_CHECK(cudaDeviceSynchronize());
     #endif  // NDEBUG
@@ -351,7 +367,7 @@ int main(int argc, char * argv[])
     for (int dup = 0; dup < kDup; ++dup)
     {
         reduceWithLastWarpUnrolled<(block.x >> 1)><<<grid, block.x >> 1>>>(
-                d_in.data().get(), d_out.data().get()
+            d_in.data().get(), d_out.data().get()
         );
     }
 
@@ -368,26 +384,19 @@ int main(int argc, char * argv[])
 
     // Unrolled block-wide reduction.
     #ifdef NDEBUG
-    reduceFullUnroll<block.x><<<grid, block>>>(
-            d_in.data().get(), n, d_part_out.data().get()
-    );
-    reduceFullUnroll<block.x><<<1, block>>>(
-            d_part_out.data().get(), grid.x, d_out.data().get()
+    reduceFullUnroll<(block.x >> 1)><<<grid, block.x >> 1>>>(
+        d_in.data().get(), d_out.data().get()
     );
     CUDA_CHECK(cudaDeviceSynchronize());
     #endif  // NDEBUG
 
-    thrust::fill(thrust::device, d_part_out.begin(), d_part_out.end(), 0.0f);
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
     CUDA_CHECK(cudaEventRecord(ss));
 
     for (int dup = 0; dup < kDup; ++dup)
     {
-        reduceFullUnroll<block.x><<<grid, block>>>(
-                d_in.data().get(), n, d_part_out.data().get()
-        );
-        reduceFullUnroll<block.x><<<1, block>>>(
-                d_part_out.data().get(), grid.x, d_out.data().get()
+        reduceFullUnroll<(block.x >> 1)><<<grid, block.x >> 1>>>(
+            d_in.data().get(), d_out.data().get()
         );
     }
 

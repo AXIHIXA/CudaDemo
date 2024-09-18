@@ -1,5 +1,5 @@
-//#define TEST_REDUCE_V5
-#define TEST_REDUCE_V6
+#define TEST_REDUCE_V5
+//#define TEST_REDUCE_V6
 
 #ifdef TEST_REDUCE_V5
 #include <bits/stdc++.h>
