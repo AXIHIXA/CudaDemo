@@ -340,6 +340,8 @@ __global__ void reduceGridTranslationWarpShuffle(const T * __restrict__ in, int 
     sum = (tid < kBlockSize / kWarpSize) ? warpSums[laneIdx] : 0;
 
     // Final reduce using the first warp.
+    // We know that each block (of size 256) will have 8 warps only.
+    // Thus a second warpShuffleReduce will sum the 8 warpSums in this block.
     if (warpIdx == 0)
     {
         sum = warpShuffleReduce(sum);
