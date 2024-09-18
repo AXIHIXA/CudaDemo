@@ -267,6 +267,36 @@ __global__ void reduceFullUnroll(const T * __restrict__ in, T * __restrict__ out
 }
 
 
+// Use grid translation (adapt to input size) instead of block translation (of compile-time constant steps).
+// Adapts to input size automatically, at a cost of degraded performance.
+// Trade-off.
+template <unsigned kBlockSize, typename T>
+__global__ void reduceGridTranslationFullUnroll(const T * __restrict__ in, int nx, T * __restrict__ out)
+{
+    __shared__ T smem[kBlockSize];
+
+    const unsigned gridSize = gridDim.x;
+    unsigned from = blockIdx.x * kBlockSize + threadIdx.x;
+    unsigned tid = threadIdx.x;
+
+    smem[tid] = 0;
+
+    for (; from < nx; from += gridSize * kBlockSize)
+    {
+        smem[tid] += in[from];
+    }
+
+    __syncthreads();
+
+    blockSmemReduce<kBlockSize>(smem);
+
+    if (tid == 0)
+    {
+        out[blockIdx.x] = smem[0];
+    }
+}
+
+
 void checkResult(const thrust::device_vector<float> & in, const thrust::host_vector<float> & out)
 {
     float res = thrust::reduce(out.cbegin(), out.cend());
@@ -355,7 +385,38 @@ int main(int argc, char * argv[])
     std::printf("took %f ms, ", ms / kDup);
     checkResult(d_in, h_out);
 
+    // Full unroll.
+    #ifdef NDEBUG
+    reduceFullUnroll<(block.x >> 1)><<<grid, block.x >> 1>>>(
+        d_in.data().get(), d_out.data().get()
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+    #endif  // NDEBUG
+
+    thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
+    CUDA_CHECK(cudaEventRecord(ss));
+
+    for (int dup = 0; dup < kDup; ++dup)
+    {
+        reduceFullUnroll<(block.x >> 1)><<<grid, block.x >> 1>>>(
+            d_in.data().get(), d_out.data().get()
+        );
+    }
+
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaEventRecord(ee));
+    CUDA_CHECK(cudaEventSynchronize(ee));
+
+    h_out = d_out;
+    std::printf("reduceFullUnroll: ");
+    CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
+    std::printf("took %f ms, ", ms / kDup);
+    checkResult(d_in, h_out);
+
+    // Grid-translation to adapt input size.
     // Last warp as unrolled warp-wide reduction.
+    // Degraded performance (unevitable cost).
     #ifdef NDEBUG
     reduceWithLastWarpUnrolled<(block.x >> 1)><<<grid, block.x >> 1>>>(
         d_in.data().get(), d_out.data().get()
@@ -386,8 +447,8 @@ int main(int argc, char * argv[])
 
     // Unrolled block-wide reduction.
     #ifdef NDEBUG
-    reduceFullUnroll<(block.x >> 1)><<<grid, block.x >> 1>>>(
-        d_in.data().get(), d_out.data().get()
+    reduceGridTranslationFullUnroll<block.x><<<grid, block.x>>>(
+        d_in.data().get(), n, d_out.data().get()
     );
     CUDA_CHECK(cudaDeviceSynchronize());
     #endif  // NDEBUG
@@ -397,8 +458,8 @@ int main(int argc, char * argv[])
 
     for (int dup = 0; dup < kDup; ++dup)
     {
-        reduceFullUnroll<(block.x >> 1)><<<grid, block.x >> 1>>>(
-            d_in.data().get(), d_out.data().get()
+        reduceGridTranslationFullUnroll<block.x><<<grid, block.x>>>(
+            d_in.data().get(), n, d_out.data().get()
         );
     }
 
@@ -408,7 +469,7 @@ int main(int argc, char * argv[])
     CUDA_CHECK(cudaEventSynchronize(ee));
 
     h_out = d_out;
-    std::printf("reduceFullUnroll: ");
+    std::printf("reduceGridTranslationFullUnroll: ");
     CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
     std::printf("took %f ms, ", ms / kDup);
     checkResult(d_in, h_out);
