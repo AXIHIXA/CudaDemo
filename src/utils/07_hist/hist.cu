@@ -142,7 +142,6 @@ __device__ int atomicAggInc(int * ctr)
 }
 
 
-/// Atomic add at warp-register level, then each warp accumulate to global ngtz.
 template <int kBlockSize>
 __global__ void filterWarp(const int * __restrict__ in, int nx, int * __restrict__ out, int * __restrict__ ngtz)
 {
