@@ -46,64 +46,86 @@ __global__ void filterNaive(const int * __restrict__ in, int nx, int * __restric
 }
 
 
-/// Each block accumulates number of >0-elements as smem,
-/// and each thread knows its >0-element-offset in block (counter before accumulation).
+/// Each block accumulates number of gt0-elements as smem,
+/// and each thread knows its in-block element offset (counter before accumulation).
 /// Each block accumulates to a global offset, and the old offset is the begin position for this block to write to.
 template <int kBlockSize>
 __global__ void filterSmem(const int * __restrict__ in, int nx, int * __restrict__ out, int * __restrict__ ngtz)
 {
-    // 计数器声明为shared memory，去计数各个block范围内大于0的数量
-    __shared__ int cnt;
+    // Block counter of greater-than-zero elements in this block.
+    __shared__ int gtz;
 
-    const int totalNumThreads = gridDim.x * kBlockSize;
+    const int totalNumberOfThreads = gridDim.x * kBlockSize;
+
     int tid = threadIdx.x;
-    int from = blockIdx.x * blockDim.x + threadIdx.x;
+    int from = blockIdx.x * kBlockSize + threadIdx.x;
 
-    for ( ; from < nx; from += totalNumThreads)
+    // Grid translation.
+    for ( ; from < nx; from += totalNumberOfThreads)
     {
-        // Zero the counter.
+        // Zero counter.
         if (tid == 0)
         {
-            cnt = 0;
+            gtz = 0;
         }
 
         __syncthreads();
 
+        // d: Set to actual value if in[from] > 0.
+        // inBlockOffset: Offset of d (if > 0) in an array containing ONLY gt0 elements in this block.
         int d = -1;
-        int nonZeroOffsetInBlock;
+        int inBlockOffset = 0;
 
-        // cnt 表示每个 block 范围内大于0的数量，block 内的线程都可访问
-        // pos 是每个线程私有的寄存器，
-        // 且作为 atomicAdd 的返回值，表示当前线程对 cnt 原子加之前的 cnt，
-        // 比如 1 2 4 号线程都大于 0，那么对于 4 号线程来说 cnt = 3, old = 2
         if (from < nx)
         {
             d = in[from];
 
             if (0 < d)
             {
-                nonZeroOffsetInBlock = atomicAdd(&cnt, 1);
+                inBlockOffset = atomicAdd(&gtz, 1);
             }
         }
 
         __syncthreads();
 
-        // Each block accumulates its numNonZero count to global ngtz.
-        // The old ngtz is the first offset this thread should write.
-        if (threadIdx.x == 0)
+        // Each block accumulates its number of gt0 elements to global counter.
+        // Return value of atomicAdd indicates the begin position of this block to write to.
+        // IMPORTANT: Reuse smem gtz counter (instead of register) to speed up.
+        // Performance: smem gtz: 0.46ms; reg offset: 0.63ms!
+
+        #if true
+        if (tid == 0)
         {
-            cnt = atomicAdd(ngtz, cnt);
+            gtz = atomicAdd(ngtz, gtz);
         }
 
         __syncthreads();
 
-        // Write & store.
-        if (from < nx && 0 < d)
+        if (0 < d)
         {
-            out[cnt + nonZeroOffsetInBlock] = d;
+            out[gtz + inBlockOffset] = d;
         }
 
         __syncthreads();
+        #endif  // true
+
+        #if false
+        int ofst = 0;
+
+        if (tid == 0)
+        {
+            ofst = atomicAdd(ngtz, gtz);
+        }
+
+        __syncthreads();
+
+        if (0 < d)
+        {
+            out[ofst + inBlockOffset] = d;
+        }
+
+        __syncthreads();
+        #endif  // false
     }
 }
 
@@ -143,6 +165,7 @@ __device__ int atomicAggInc(int * ctr)
 
 
 /// Atomic add at warp-register level, then each warp accumulate to global ngtz.
+/// In-warp element offset is simply index of active warp (needs asm lanemask_lt).
 template <int kBlockSize>
 __global__ void filterWarp(const int * __restrict__ in, int nx, int * __restrict__ out, int * __restrict__ ngtz)
 {
@@ -182,9 +205,9 @@ int main(int argc, char * argv[])
     thrust::device_vector<int> d_in = h_in;
     int gt = std::count_if(h_in.cbegin(), h_in.cend(), [](int x) { return 0 < x; });
 
-    thrust::device_vector<int> d_nres(1);
+    thrust::device_vector<int> d_ngtz(1);
     thrust::device_vector<int> d_out = h_in;
-    thrust::host_vector<int> h_nres(1);
+    thrust::host_vector<int> h_ngtz(1);
 
     constexpr dim3 block = {256};
     CUDA_CHECK(cudaSetDevice(0));
@@ -199,50 +222,50 @@ int main(int argc, char * argv[])
     CUDA_CHECK(cudaEventCreate(&ee));
 
     // Naive.
-    thrust::fill(thrust::device, d_nres.begin(), d_nres.end(), 0);
+    thrust::fill(thrust::device, d_ngtz.begin(), d_ngtz.end(), 0);
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0);
 
     CUDA_CHECK(cudaEventRecord(ss));
-    filterNaive<block.x><<<grid, block>>>(d_in.data().get(), n, d_out.data().get(), d_nres.data().get());
+    filterNaive<block.x><<<grid, block>>>(d_in.data().get(), n, d_out.data().get(), d_ngtz.data().get());
     CUDA_CHECK_LAST_ERROR();
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaEventRecord(ee));
     CUDA_CHECK(cudaEventSynchronize(ee));
     CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
 
-    h_nres = d_nres;
+    h_ngtz = d_ngtz;
     std::printf("filterNaive took %f ms, ", ms);
-    checkResult(h_nres[0], gt);
+    checkResult(h_ngtz[0], gt);
 
     // Smem.
-    thrust::fill(thrust::device, d_nres.begin(), d_nres.end(), 0);
+    thrust::fill(thrust::device, d_ngtz.begin(), d_ngtz.end(), 0);
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0);
     CUDA_CHECK(cudaEventRecord(ss));
-    filterSmem<block.x><<<grid, block>>>(d_in.data().get(), n, d_out.data().get(), d_nres.data().get());
+    filterSmem<block.x><<<grid, block>>>(d_in.data().get(), n, d_out.data().get(), d_ngtz.data().get());
     CUDA_CHECK_LAST_ERROR();
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaEventRecord(ee));
     CUDA_CHECK(cudaEventSynchronize(ee));
     CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
 
-    h_nres = d_nres;
+    h_ngtz = d_ngtz;
     std::printf("filterSmem took %f ms, ", ms);
-    checkResult(h_nres[0], gt);
+    checkResult(h_ngtz[0], gt);
 
     // Warp.
-    thrust::fill(thrust::device, d_nres.begin(), d_nres.end(), 0);
+    thrust::fill(thrust::device, d_ngtz.begin(), d_ngtz.end(), 0);
     thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0);
     CUDA_CHECK(cudaEventRecord(ss));
-    filterWarp<block.x><<<grid, block>>>(d_in.data().get(), n, d_out.data().get(), d_nres.data().get());
+    filterWarp<block.x><<<grid, block>>>(d_in.data().get(), n, d_out.data().get(), d_ngtz.data().get());
     CUDA_CHECK_LAST_ERROR();
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaEventRecord(ee));
     CUDA_CHECK(cudaEventSynchronize(ee));
     CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
 
-    h_nres = d_nres;
+    h_ngtz = d_ngtz;
     std::printf("filterWarp took %f ms, ", ms);
-    checkResult(h_nres[0], gt);
+    checkResult(h_ngtz[0], gt);
 
     CUDA_CHECK(cudaEventDestroy(ss));
     CUDA_CHECK(cudaEventDestroy(ee));

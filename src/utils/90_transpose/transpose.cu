@@ -41,12 +41,12 @@ __global__ void transposeNaive(const T * __restrict__ in, int nx, int ny, T * __
 template <int kPadding = 1, typename T>
 __global__ void transpose(const T * __restrict__ in, int nx, int ny, T * __restrict__ out)
 {
-    extern __shared__ T smem[];
+    extern __shared__ T smem[];  // smem[blockDim.y][blockDim.x + kPadding].
 
-    unsigned ix = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned iy = blockIdx.y * blockDim.y + threadIdx.y;
-    unsigned from = iy * nx + ix;
-    unsigned s = threadIdx.y * (blockDim.x + kPadding) + threadIdx.x;
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy = blockIdx.y * blockDim.y + threadIdx.y;
+    int from = iy * nx + ix;
+    int s = threadIdx.y * (blockDim.x + kPadding) + threadIdx.x;
 
     if (ix < nx && iy < ny)
     {
@@ -55,14 +55,16 @@ __global__ void transpose(const T * __restrict__ in, int nx, int ny, T * __restr
 
     __syncthreads();
 
-    unsigned t = threadIdx.y * blockDim.x + threadIdx.x;
-    unsigned sx = t / blockDim.y;
-    unsigned sy = t % blockDim.y;
+    // This thread will write t-th (column major) element in smem.
+    // What's its x, y coordinates in this block?
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int sx = tid / blockDim.y;
+    int sy = tid % blockDim.y;
     s = sy * (blockDim.x + kPadding) + sx;
 
     ix = blockIdx.y * blockDim.y + sy;
     iy = blockIdx.x * blockDim.x + sx;
-    unsigned to = iy * ny + ix;
+    int to = iy * ny + ix;
 
     if (ix < ny && iy < nx)
     {
@@ -200,6 +202,7 @@ int main(int argc, char * argv[])
 
     h_out = d_out;
     CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
+    std::printf("transpose: ");
     std::printf("took %f ms, ", ms / kDup);
     checkResult(h_in, r, c, h_out);
 
@@ -208,6 +211,10 @@ int main(int argc, char * argv[])
 
     return EXIT_SUCCESS;
 }
+
+// transposeNaive: took 0.418214 ms, Result is correct.
+//
+// transpose: took 0.157615 ms, Result is correct.
 
 /*
 # Profile gld_throughput, gld_efficiency, gst_throughput and gst_efficiency.

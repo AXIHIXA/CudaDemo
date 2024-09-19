@@ -26,11 +26,15 @@ set(ALL_COMPILE_DEFS
 
 )
 
+set(X_PTXAS_V
+        -Xptxas -v
+)
+
 set(ALL_COMPILE_OPTS
         # -g is default in CMAKE_<LANG>_FLAGS_DEBUG
         $<$<CONFIG:DEBUG>:-O0>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:-G>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:-lineinfo>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:${X_PTXAS_V}>
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
         $<$<COMPILE_LANGUAGE:CUDA>:--relocatable-device-code=true>
 )

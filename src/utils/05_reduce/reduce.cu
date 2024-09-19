@@ -155,13 +155,24 @@ __global__ void reduceWithLastWarpUnrolled(const T * __restrict__ in, T * __rest
 
 
 template <int kBlockSize, typename T>
-__device__ void blockSmemReduce(volatile T * __restrict__ smem)
+__device__ void blockSmemReduce(T * __restrict__ smem)
 {
-    unsigned tid = threadIdx.x;
+    int tid = threadIdx.x;
 
-    #define MANUAL_UNROLL
+    // Reference of the unroll below.
+    #if false
+    #pragma unroll
+    for (unsigned s = (kBlockSize >> 1); 32 < s; s >>= 1)
+    {
+        if (tid < s)
+        {
+            smem[tid] += smem[tid + s];
+        }
 
-    #ifdef MANUAL_UNROLL
+        __syncthreads();
+    }
+    #endif  // false
+
     // Completely unroll the for loop,
     // wiping out addition instructions in for updates,
     // and offering compiler with more freedom for reordering.
@@ -205,18 +216,6 @@ __device__ void blockSmemReduce(volatile T * __restrict__ smem)
 
         __syncthreads();
     }
-    #else
-    #pragma unroll
-    for (unsigned s = (kBlockSize >> 1); 32 < s; s >>= 1)
-    {
-        if (tid < s)
-        {
-            smem[tid] += smem[tid + s];
-        }
-
-        __syncthreads();
-    }
-    #endif  // MANUAL_UNROLL
 
     // The final warp unrolled.
     if (tid < 32)
@@ -252,8 +251,8 @@ __global__ void reduceFullUnroll(const T * __restrict__ in, T * __restrict__ out
 {
     __shared__ T smem[kBlockSize];
 
-    unsigned from = blockIdx.x * kBlockSize * 2 + threadIdx.x;
-    unsigned tid = threadIdx.x;
+    int from = blockIdx.x * kBlockSize * 2 + threadIdx.x;
+    int tid = threadIdx.x;
 
     smem[tid] = in[from] + in[from + kBlockSize];
     __syncthreads();
@@ -309,6 +308,8 @@ __device__ T warpShuffleReduce(T sum)
 }
 
 
+/// Reach best performance when input size is around 25'600.
+/// Degrades to sub-optimal when input size grows larger.
 template <unsigned kBlockSize, unsigned kWarpSize, typename T>
 __global__ void reduceGridTranslationWarpShuffle(const T * __restrict__ in, int nx, T * __restrict__ out)
 {
@@ -364,7 +365,7 @@ void checkResult(const thrust::device_vector<float> & in, const thrust::host_vec
 
 int main(int argc, char * argv[])
 {
-    constexpr int n = 25'600'000;
+    constexpr int n = 25'600;
     thrust::host_vector<float> h_in(n, 1.0f);
     thrust::device_vector<float> d_in = h_in;
     thrust::device_vector<float> d_out(n, 0.0f);
@@ -442,6 +443,35 @@ int main(int argc, char * argv[])
     std::printf("took %f ms, ", ms / kDup);
     checkResult(d_in, h_out);
 
+    // Unrolled last warp.
+    #ifdef NDEBUG
+    reduceWithLastWarpUnrolled<(block.x >> 1)><<<grid, block.x >> 1>>>(
+        d_in.data().get(), d_out.data().get()
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+    #endif  // NDEBUG
+
+    thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
+    CUDA_CHECK(cudaEventRecord(ss));
+
+    for (int dup = 0; dup < kDup; ++dup)
+    {
+        reduceWithLastWarpUnrolled<(block.x >> 1)><<<grid, block.x >> 1>>>(
+            d_in.data().get(), d_out.data().get()
+        );
+    }
+
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaEventRecord(ee));
+    CUDA_CHECK(cudaEventSynchronize(ee));
+
+    h_out = d_out;
+    std::printf("reduceWithLastWarpUnrolled: ");
+    CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
+    std::printf("took %f ms, ", ms / kDup);
+    checkResult(d_in, h_out);
+
     // Full unroll.
     #ifdef NDEBUG
     reduceFullUnroll<(block.x >> 1)><<<grid, block.x >> 1>>>(
@@ -474,35 +504,6 @@ int main(int argc, char * argv[])
     // Grid-translation to adapt input size.
     // Last warp as unrolled warp-wide reduction.
     // Degraded performance (unevitable cost).
-    #ifdef NDEBUG
-    reduceWithLastWarpUnrolled<(block.x >> 1)><<<grid, block.x >> 1>>>(
-        d_in.data().get(), d_out.data().get()
-    );
-    CUDA_CHECK(cudaDeviceSynchronize());
-    #endif  // NDEBUG
-
-    thrust::fill(thrust::device, d_out.begin(), d_out.end(), 0.0f);
-    CUDA_CHECK(cudaEventRecord(ss));
-
-    for (int dup = 0; dup < kDup; ++dup)
-    {
-        reduceWithLastWarpUnrolled<(block.x >> 1)><<<grid, block.x >> 1>>>(
-            d_in.data().get(), d_out.data().get()
-        );
-    }
-
-    CUDA_CHECK_LAST_ERROR();
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaEventRecord(ee));
-    CUDA_CHECK(cudaEventSynchronize(ee));
-
-    h_out = d_out;
-    std::printf("reduceWithLastWarpUnrolled: ");
-    CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
-    std::printf("took %f ms, ", ms / kDup);
-    checkResult(d_in, h_out);
-
-    // Unrolled block-wide reduction.
     #ifdef NDEBUG
     reduceGridTranslationFullUnroll<block.x><<<grid, block.x>>>(
         d_in.data().get(), n, d_out.data().get()
@@ -568,15 +569,15 @@ int main(int argc, char * argv[])
 }
 
 /*
-reduceNaive: took 0.471717 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+reduceNaive: took 0.646083 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
 
-reduceFatBlock: took 0.222054 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+reduceFatBlock: took 0.295687 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
 
-reduceFullUnroll: took 0.186880 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+reduceWithLastWarpUnrolled: took 0.181950 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
 
-reduceWithLastWarpUnrolled: took 0.181041 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+reduceFullUnroll: took 0.180863 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
 
-reduceGridTranslationFullUnroll: took 0.364141 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+reduceGridTranslationFullUnroll: took 0.364220 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
 
-reduceGridTranslationWarpShuffle: took 0.289644 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
+reduceGridTranslationWarpShuffle: took 0.291430 ms, Result: 25600000.000000 vs 25600000.000000, is correct.
 */
