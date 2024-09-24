@@ -41,6 +41,8 @@ set(ALL_COMPILE_OPTS
 
 set(DEMO demo)
 add_executable(${DEMO}
+        include/scan/scan.cuh
+        include/scan/uninitialized_copy.cuh
         include/utils/cuda_utils.h
         src/main.cu
 )

@@ -245,7 +245,7 @@ int main(int argc, char * argv[])
             thrust::raw_pointer_cast(d_c.data()),
             m,
             n,
-            k, 
+            k,
             1.0f,
             1.0f
         );
