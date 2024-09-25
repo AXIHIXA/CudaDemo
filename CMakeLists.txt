@@ -26,23 +26,22 @@ set(ALL_COMPILE_DEFS
 
 )
 
-set(X_PTXAS_V
+set(CUDA_DEBUG_FLAGS
         -Xptxas -v
+        -G
+        #-lineinfo  # "-lineinfo" by default under "-G"
 )
 
 set(ALL_COMPILE_OPTS
         # -g is default in CMAKE_<LANG>_FLAGS_DEBUG
         $<$<CONFIG:DEBUG>:-O0>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:-G>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:${X_PTXAS_V}>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:${CUDA_DEBUG_FLAGS}>
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
         $<$<COMPILE_LANGUAGE:CUDA>:--relocatable-device-code=true>
 )
 
 set(DEMO demo)
 add_executable(${DEMO}
-        include/scan/scan.cuh
-        include/scan/uninitialized_copy.cuh
         include/utils/cuda_utils.h
         src/main.cu
 )
