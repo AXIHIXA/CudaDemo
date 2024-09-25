@@ -156,9 +156,17 @@ __global__ void gemmNaive(const in_t * __restrict__ a,
 /// GEMM kernel calculating alpha * (A @ B) + beta * C.
 /// Utilizes shared memory (padded to avoid bank conflict),
 /// and vectorized loads/stores (GMEM <-> SMEM).
+///
 /// Each thread block has (kBlockSize, kBlockSize) threads,
 /// Computing a square of (kBlockM, kBlockN) elements in output matrix.
 /// Thus each thread computes a square of (kBlockM, kBlockN) / kBlockSize elements.
+///
+/// It's reasonable to tile-by-df-dimension,
+/// as each thread block computes by kBlockM * kBlockN * dk,
+/// and accesses GMEM by kBlockM * dk + kBlockN * dk,
+/// the compute-memory ratio is 1 / ( 1/kBlockM + 1/kBlockN ),
+/// which is irrelevant with dimension dk.
+///
 /// Moreover, we take the "outer product" way to accumulate elements in output.
 /// Each time a thread block loads
 /// (kBlockM, kBlockK) elements from A,
@@ -200,12 +208,12 @@ __global__ void gemmSmem(const float * __restrict__ a,
     __shared__ float semeB[kBlockK][kBlockN + kPadding] = {};
 
     // For chunk a (128, 8), each two threads load a whole row (of size 8).
-    // For chunk b (8, 128), each two threads load a whole column (of size 8).
-    int rowA = baseIdx >> 1;
+    // For chunk b (8, 128), each 32 threads load a whole row (of size 128).
+    int rowA = baseIdx >> 1;          // each two threads load a row
     int colA = (baseIdx & 1) << 2;    // column index of the 1st element to load.
 
-    int rowB = baseIdx >> 5;          //
-    int colB = (baseIdx << 2) & 127;
+    int rowB = baseIdx >> 5;          // each 32 threads load a row
+    int colB = (baseIdx << 2) & 127;  // column index of the 1st element to load.
 
     int rowC = ((warpIdx >> 1 << 3) + (laneIdx & 3)) << 2;
     int colC = (((warpIdx & 1) << 4) + (laneIdx >> 2)) << 2;
@@ -221,7 +229,6 @@ __global__ void gemmSmem(const float * __restrict__ a,
     for (int k0 = 0; k0 < dk; k0 += kBlockK)
     {
 
-        int rowA = baseIdx >> 1;
     }
 
 //    acc_t reg[kThreadM][kThreadN] = {0};
