@@ -18,9 +18,9 @@
 
 /// Naive CPU GEMM kernel calculating alpha * (A @ B) + beta * C.
 /// Just for demo purpose. Do not call this method. It's SUPER SLOW!
-/// \param[in] A: shape=(dm, dk)
-/// \param[in] B: shape=(dk, dn)
-/// \param[in/out] C: shape=(dm, dn)
+/// \param[in] A      shape=(dm, dk)
+/// \param[in] B      shape=(dk, dn)
+/// \param[in/out] C  shape=(dm, dn)
 template <typename in_t, typename acc_t>
 void gemmCpuNaive(const in_t * __restrict__ a,
                   const in_t * __restrict__ b,
@@ -59,9 +59,9 @@ void gemmCpuNaive(const in_t * __restrict__ a,
 /// Each thread block has (kBlockSize, kBlockSize) threads,
 /// Computing a square of (kBlockM, kBlockN) elements in output matrix.
 /// Thus each thread computes a square of (kBlockM, kBlockN) / kBlockSize elements.
-/// \param[in] A: shape=(dm, dk)
-/// \param[in] B: shape=(dk, dn)
-/// \param[in/out] C: shape=(dm, dn)
+/// \param[in] A      shape=(dm, dk)
+/// \param[in] B      shape=(dk, dn)
+/// \param[in/out] C  shape=(dm, dn)
 template <int kBlockSize, int kBlockM, int kBlockN, int kBlockK, typename in_t, typename acc_t>
 __global__ void gemmNaive(const in_t * __restrict__ a,
                           const in_t * __restrict__ b,
@@ -97,17 +97,6 @@ __global__ void gemmNaive(const in_t * __restrict__ a,
         }
     }
 
-//    for (int i = 0; i < kThreadM; ++i)
-//    {
-//        for (int j = 0; j < kThreadN; ++j)
-//        {
-//            if (ty + i < dm && tx + j < dn && reg[i][j] != 512)
-//            {
-//                printf("(%d %d)\n", ty + i, tx + j);
-//            }
-//        }
-//    }
-
     for (int m = 0; m < kThreadM; ++m)
     {
         for (int n = 0; n < kThreadN; ++n)
@@ -120,8 +109,6 @@ __global__ void gemmNaive(const in_t * __restrict__ a,
             }
         }
     }
-
-
 }
 
 
@@ -133,9 +120,9 @@ __global__ void gemmNaive(const in_t * __restrict__ a,
 /// the result is (AB).T in column major, which equals AB in row major!
 /// And, B.T and A.T (in column major) equals B and A (in row major).
 /// So just pass in B and A (in row major, not transposed) and corresponding shapes (transposed).
-/// \param[in] A: shape=(dm, dk)
-/// \param[in] B: shape=(dk, dn)
-/// \param[in/out] C: shape=(dm, dn)
+/// \param[in] A      shape=(dm, dk)
+/// \param[in] B      shape=(dk, dn)
+/// \param[in/out] C  shape=(dm, dn)
 void gemmCublas(const float * __restrict__ a,
                 const float * __restrict__ b,
                 float * __restrict__ c,
@@ -187,37 +174,37 @@ struct Equal<float>
 };
 
 
-template <typename acc_t>
+template <bool kDebugOutput = false, typename acc_t>
 void checkResult(const thrust::device_vector<acc_t> & result,
                  const thrust::device_vector<acc_t> & golden,
                  int dm,
                  int dn)
 {
-    #define DEBUG_OUTPUT
-    #ifdef DEBUG_OUTPUT
-    thrust::host_vector<acc_t> a = result;
-    thrust::host_vector<acc_t> b = golden;
-    printf("Result:\n");
-    for (int i = 0, k = 0; i < 1; ++i)
+    if constexpr (kDebugOutput)
     {
-        for (int j = 0; j < dn; ++j, ++k)
+        thrust::host_vector<acc_t> a = result;
+        thrust::host_vector<acc_t> b = golden;
+        printf("Result:\n");
+        for (int i = 0, k = 0; i < 1; ++i)
         {
-            printf("%f ", a[k]);
+            for (int j = 0; j < dn; ++j, ++k)
+            {
+                printf("%f ", a[k]);
+            }
+            printf("\n");
         }
-        printf("\n");
-    }
-    printf("\n\n");
-    printf("Ground truth:\n");
-    for (int i = 0, k = 0; i < 1; ++i)
-    {
-        for (int j = 0; j < dn; ++j, ++k)
+        printf("\n\n");
+        printf("Ground truth:\n");
+        for (int i = 0, k = 0; i < 1; ++i)
         {
-            printf("%f ", b[k]);
+            for (int j = 0; j < dn; ++j, ++k)
+            {
+                printf("%f ", b[k]);
+            }
+            printf("\n");
         }
-        printf("\n");
+        printf("\n\n");
     }
-    printf("\n\n");
-    #endif  // DEBUG_OUTPUT
 
     bool resultIsCorrect = thrust::equal(thrust::device, result.cbegin(), result.cend(), golden.cbegin(), Equal<acc_t>());
     std::printf("Result is %s\n\n", resultIsCorrect ? "correct." : "WRONG!!!");
@@ -226,16 +213,27 @@ void checkResult(const thrust::device_vector<acc_t> & result,
 
 int main(int argc, char * argv[])
 {
+    /// Switches for debugging output correctness.
+    /// \param kDup        Set to 1 to debug output (kernel only launched once) and results will be checked.
+    ///                    Set to values greater than 1 to profile.
+    ///                    In the latter case, results will NOT be checked because it's in-place GEMM.
+    ///                    We do not dispatch by build type because we have -G flag for Debug builds
+    ///                    (that's for debugging runtime errors).
+    /// \param kRandInput  Whether we random input matrices.
+    ///                    Enable when checking correctness or profiling.
+    ///                    Disenable when debugging output.
+    constexpr int kDup = 1;
+    constexpr bool kRandInput = true;
+
+    // Problem setting.
     int m = 1024;
-    int n = 2048;
-    int k = 512;
+    int n = 1024;
+    int k = 1024;
     float alpha = 1.0f;
     float beta = 1.0f;
     thrust::host_vector<float> h_a(m * k, 1.0f);
     thrust::host_vector<float> h_b(k * n, 1.0f);
     thrust::host_vector<float> h_c(m * n, 0.0f);
-
-    constexpr bool kRandInput = true;
 
     if constexpr (kRandInput)
     {
@@ -263,14 +261,6 @@ int main(int argc, char * argv[])
                alpha,
                beta);
     golden_c = d_c;
-
-    // Switch for debugging output correctness.
-    // Set to 1 to debug output (kernel only launched once) and results will be checked.
-    // Set to values greater than 1 to profile.
-    // In the latter case, results will NOT be checked because it's in-place GEMM.
-    // We do not dispatch by build type because we have -G flag for Debug builds
-    // (that's for debugging runtime errors).
-    constexpr int kDup = 100;
 
     constexpr int kBlockSize = 16;
     constexpr int kBlockM = 128;
