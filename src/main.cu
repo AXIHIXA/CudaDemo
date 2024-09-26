@@ -404,6 +404,7 @@ __global__ void gemmSmemPad(const float * __restrict__ A,
     {
         // Each thread loads its float4 from matrix A into smem (but stores in COLUMN-major).
         // That's because smemA will be accessed in column major afterward.
+        // Since we're writing SMEM in column major, we need to pad column to eliminate bank conflicts.
         regA[0] = *reinterpret_cast<const float4 *>(baseA + i + rowA * dk + colA);
         subA[rowA + colA * kLdSubA] = regA[0].x;
         subA[rowA + (colA + 1) * kLdSubA] = regA[0].y;
@@ -411,6 +412,7 @@ __global__ void gemmSmemPad(const float * __restrict__ A,
         subA[rowA + (colA + 3) * kLdSubA] = regA[0].w;
 
         // Each thread loads its float4 from matrix B into smem.
+        // Because the SMEM stores are coalesced, there's natually no bank conflict.
         regB[0] = *reinterpret_cast<const float4 *>(baseB + (i + rowB) * dn + colB);
         *reinterpret_cast<float4 *>(&subB[tid * 4]) = regB[0];
 
