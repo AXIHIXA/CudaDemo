@@ -27,9 +27,8 @@ set(ALL_COMPILE_DEFS
 )
 
 set(CUDA_DEBUG_FLAGS
-        -Xptxas -v
-        -G
-        #-lineinfo  # "-lineinfo" by default under "-G"
+        -Xptxas -v  # Check register spills during linking (-X compiler flag will be forwarded to linker)
+        -G  # "-lineinfo" by default under "-G"
 )
 
 set(ALL_COMPILE_OPTS
@@ -37,7 +36,7 @@ set(ALL_COMPILE_OPTS
         $<$<CONFIG:DEBUG>:-O0>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:${CUDA_DEBUG_FLAGS}>
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
-        $<$<COMPILE_LANGUAGE:CUDA>:--relocatable-device-code=true>
+        $<$<COMPILE_LANGUAGE:CUDA>:--relocatable-device-code=true>  # For dynamic parallelism
 )
 
 set(DEMO demo)
@@ -46,8 +45,8 @@ add_executable(${DEMO}
         src/main.cu
 )
 set_target_properties(${DEMO} PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        CUDA_SEPARABLE_COMPILATION ON   # For dynamic parallelism
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON  # For dynamic parallelism
 )
 target_compile_definitions(${DEMO} PUBLIC ${ALL_COMPILE_DEFS})
 target_compile_options(${DEMO} PUBLIC ${ALL_COMPILE_OPTS})

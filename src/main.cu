@@ -242,6 +242,12 @@ __global__ void gemmSmem(const float * __restrict__ A,
         // That's because subA will be accessed in column major afterward
         // (the outer loop only executes for kBlockK == 8 times,
         // so chunk A must be accessed in column major.)
+        // Note that this pattern has bank conflicts on stores to subA.
+        // Each consecutive 2 threads have bank conflicts.
+        // E.g., Block (0, 0), threads (0, 0), (1, 0), (2, 0), (3, 0), ...
+        // Indices (bank): 0 128(0) 128x2(0) 128x3(0),       128x4(0) 128x5(0) 128x6(0) 128x7(0),
+        //                 1 1+128(1) 1+128x2(1) 1+128x3(1), 1+128x4(1) 1+128x5(1) 1+128x6(1) 1+128x7(1),
+        // Each two consecutive threads have bank conflicts.
         regA[0] = *reinterpret_cast<const float4 *>(baseA + i + rowA * dk + colA);
         subA[rowA + colA * kBlockM] = regA[0].x;
         subA[rowA + (colA + 1) * kBlockM] = regA[0].y;
@@ -249,6 +255,7 @@ __global__ void gemmSmem(const float * __restrict__ A,
         subA[rowA + (colA + 3) * kBlockM] = regA[0].w;
 
         // Each thread loads its float4 from matrix B into smem.
+        // Naturally no bank conflict here.
         regB[0] = *reinterpret_cast<const float4 *>(baseB + (i + rowB) * dn + colB);
         *reinterpret_cast<float4 *>(&subB[tid * 4]) = regB[0];
 
@@ -263,14 +270,32 @@ __global__ void gemmSmem(const float * __restrict__ A,
             // Each threads holds 8 floats in a column.
             // Note that we only use threadIdx.x here, it's on purpose.
             // There are multiple C-blocks requiring the same rows in A!
+            // Also note that this pattern has bank conflicts on loads from subA.
+            // Each consecutive 8 threads have bank conflicts.
+            // E.g., Block (0, 0), Threads (0, 0), (1, 0), (2, 0), (3, 0), (4, 0), ...
+            // Indices (bank): 0, 8, 16, 24, 32(0), ...
             regA[0] = *reinterpret_cast<float4 *>(&subA[ii * kBlockM + threadIdx.x * kThreadM]);
+            // E.g., Block (0, 0), Threads (0, 0), (1, 0), (2, 0), (3, 0), (4, 0), ...
+            // Indices (bank): 4, 12, 20, 28, 36(4), ...
             regA[1] = *reinterpret_cast<float4 *>(&subA[ii * kBlockM + threadIdx.x * kThreadM + 4]);
 
             // Load subB by row.
             // All threads in this thread block are bringing into register a whole row in B-chunk.
             // Each thread holds 8 floats in a row.
+            // Naturally no bank conflict here (threads in the same phase read the same address).
             regB[0] = *reinterpret_cast<float4 *>(&subB[ii * kBlockN + threadIdx.y * kThreadN]);
             regB[1] = *reinterpret_cast<float4 *>(&subB[ii * kBlockN + threadIdx.y * kThreadN + 4]);
+
+            // c is a kThreadM * kThreadN (8x8) block.
+            //     0                 3   4                 7
+            // 0   regA[0].x * regB[0]   regA[0].x * regB[1]
+            // 1   regA[0].y * regB[0]   regA[0].x * regB[1]
+            // 2   regA[0].z * regB[0]   regA[0].x * regB[1]
+            // 3   regA[0].w * regB[0]   regA[0].x * regB[1]
+            // 4   regA[1].x * regB[0]   regA[1].x * regB[1]
+            // 5   regA[1].y * regB[0]   regA[1].x * regB[1]
+            // 6   regA[1].z * regB[0]   regA[1].x * regB[1]
+            // 7   regA[1].w * regB[0]   regA[1].x * regB[1]
 
             #pragma unroll
             for (int cpi = 0; cpi < kThreadM / 4; ++cpi)
@@ -340,8 +365,10 @@ __global__ void gemmSmem(const float * __restrict__ A,
 
 
 /// GEMM kernel calculating alpha * (A @ B) + beta * C.
-/// Utilizes SMEM (eliminates bank conflict via padding),
-/// and vectorized loads/stores (GMEM <-> REG <-> SMEM) via float4.
+/// Utilizes SMEM,
+/// eliminates SMEM STORE bank conflicts via padding,
+/// and SMEM LOAD bank conflicts via warp tiling.
+/// Also uses vectorized loads/stores (GMEM <-> REG <-> SMEM) via float4.
 /// \param[in] A      shape=(dm, dk)
 /// \param[in] B      shape=(dk, dn)
 /// \param[in/out] C  shape=(dm, dn)
@@ -382,6 +409,7 @@ __global__ void gemmSmemPad(const float * __restrict__ A,
     // B chunk has shape (kBlockK, kBlockN) == (8, 128).
     // While a hread block has shape (kBlockSize, kBlockSize) == (16, 16).
     // Thus, each thread should load a float4 from A, and another float4 from B.
+    // Padding resolves bank conflicts on SMEM stores.
     constexpr int kLdSubA = kBlockM + kPadding;
     __shared__ float subA[kLdSubA * kBlockK];
     __shared__ float subB[kBlockK * kBlockN];
@@ -400,7 +428,28 @@ __global__ void gemmSmemPad(const float * __restrict__ A,
 
     // Index of C.
     // Padding resolves bank conflicts on SMEM stores.
-    // The special warp tiling pattern handles bank conflicts on SMEM loads.
+    // The special transposed warp tiling pattern resolves bank conflicts on SMEM loads.
+    // Warp-side view:
+    // All row/col indices offset by 4 per thread.
+    //       0   4   8  12  16  20  24  28
+    //    +-------------------------------
+    //  0 | 00  04  08  12  16  20  24  28
+    //  4 | 01  05  09  13  17  21  25  29
+    //  8 | 02  06  10  14  18  22  26  30
+    // 12 | 03  07  11  15  19  23  27  31
+    // A thread will no longer handle a 8x8 submatrix in C.
+    // it handles four 4x4 submatrices located (top-left-corner's linear index in C)
+    // at baseC, baseC + 32, baseC + 16 * dn, baseC + 16 * dn + 32, in a loop[1...4].
+    // Block-side view:
+    //     baseC  [ 0  31]  [32  63]  [64  95]  [96 127]
+    //  [ 0  15]  [Warp 0]  [Warp  ]  [Warp 1]  [Warp  ]
+    //  [16  31]  [Warp  ]  [Warp  ]  [Warp  ]  [Warp  ]
+    //  [32  47]  [Warp 2]  [Warp  ]  [Warp 3]  [Warp  ]
+    //  [48  63]  [Warp  ]  [Warp  ]  [Warp  ]  [Warp  ]
+    //  [64  79]  [Warp 4]  [Warp  ]  [Warp 5]  [Warp  ]
+    //  [80  95]  [Warp  ]  [Warp  ]  [Warp  ]  [Warp  ]
+    //  [96 111]  [Warp 6]  [Warp  ]  [Warp 7]  [Warp  ]
+    // [112 127]  [Warp  ]  [Warp  ]  [Warp  ]  [Warp  ]
     int rowC = ((warpIdx >> 1 << 3) + (laneIdx & 3)) << 2;
     int colC = (((warpIdx & 1) << 4) + (laneIdx >> 2)) << 2;
     float * __restrict__ baseC = C + (by + rowC) * dn + bx + colC;
@@ -431,13 +480,34 @@ __global__ void gemmSmemPad(const float * __restrict__ A,
         // So all data needed for this tile on dim K are loaded into SMEM.
         __syncthreads();
 
+        // So the SMEM stores are indentical to naive SMEM kernel, except the padding.
+
         #pragma unroll
         for (int ii = 0; ii < kBlockK; ++ii)
         {
+            // No bank conflict this time.
+            // But since regA[0...1] does not hold consecutive 8 floats,
+            // the results need to be stored to somewhere else (strided...)
+            // E.g., block (0, 0), thread (0, 0), (1, 0), (2, 0), (3, 0), ...
+            // subA   0   4   8  12  0  4  8  12 (broadcast, no bank conflict)
             regA[0] = *reinterpret_cast<float4 *>(&subA[ii * kLdSubA + rowC]);
+            // subA  16  20  24  28  16  20  24  28 (broadcast, no bank conflict)
             regA[1] = *reinterpret_cast<float4 *>(&subA[ii * kLdSubA + rowC + 16]);
+            // subB   0   0   0   0   4   4   4   4 (broadcast, no bank conflict)
             regB[0] = *reinterpret_cast<float4 *>(&subB[ii * kBlockN + colC]);
+            // subB  32(0) 32(0) 32(0) 32(0) 36(4) 36(4) 36(4) 36(4) (broadcast, no bank conflict)
             regB[1] = *reinterpret_cast<float4 *>(&subB[ii * kBlockN + colC + 32]);
+
+            // c is a kThreadM * kThreadN (8x8) block, SAME AS SmemNaive.
+            //     0                 3   4                 7
+            // 0   regA[0].x * regB[0]   regA[0].x * regB[1]
+            // 1   regA[0].y * regB[0]   regA[0].x * regB[1]
+            // 2   regA[0].z * regB[0]   regA[0].x * regB[1]
+            // 3   regA[0].w * regB[0]   regA[0].x * regB[1]
+            // 4   regA[1].x * regB[0]   regA[1].x * regB[1]
+            // 5   regA[1].y * regB[0]   regA[1].x * regB[1]
+            // 6   regA[1].z * regB[0]   regA[1].x * regB[1]
+            // 7   regA[1].w * regB[0]   regA[1].x * regB[1]
 
             #pragma unroll
             for (int cpi = 0; cpi < kThreadM / 4; ++cpi)
@@ -507,8 +577,9 @@ __global__ void gemmSmemPad(const float * __restrict__ A,
 
 /// GEMM kernel calculating alpha * (A @ B) + beta * C.
 /// Utilizes SMEM,
-/// eliminates bank conflict on loads (but NOT on stores) via warp tiling,
-/// and also uses vectorized loads/stores (GMEM <-> REG <-> SMEM) via float4.
+/// eliminates SMEM LOAD bank conflicts via warp tiling,
+/// (but leaving SMEM STORE bank conflicts as-is).
+/// Also uses vectorized loads/stores (GMEM <-> REG <-> SMEM) via float4.
 /// \param[in] A      shape=(dm, dk)
 /// \param[in] B      shape=(dk, dn)
 /// \param[in/out] C  shape=(dm, dn)
@@ -566,6 +637,22 @@ __global__ void gemmSmemWarpTile(const float * __restrict__ A,
 
     // Index of C with warp tiling.
     const int ldb8 = dn * 8;
+
+    // Warp-side view:
+    // All row/col indices offset by 8 per thread.
+    //       0   8  16  24  32  40  48  56
+    //    +-------------------------------
+    //  0 | 00  04  08  12  16  20  24  28
+    //  8 | 01  05  09  13  17  21  25  29
+    // 16 | 02  06  10  14  18  22  26  30
+    // 24 | 03  07  11  15  19  23  27  31
+    // A thread handles a 8x8 submatrix in C.
+    // Block-side view:
+    //    baseC  [ 0  64]  [64 127]
+    // [ 0  31]  [Warp 0]  [Warp 1]
+    // [32  63]  [Warp 2]  [Warp 3]
+    // [64  95]  [Warp 4]  [Warp 5]
+    // [96 127]  [Warp 6]  [Warp 7]
     int rowC = ((warpIdx >> 1 << 2) + (laneIdx & 3)) << 3;
     int colC = (((warpIdx & 1) << 3) + (laneIdx >> 2)) << 3;
     float * __restrict__ baseC = C + (by + rowC) * dn + bx + colC;
@@ -579,6 +666,7 @@ __global__ void gemmSmemWarpTile(const float * __restrict__ A,
 
     for (int i = 0; i < dk; i += kBlockK)
     {
+        // Still the same SMEM STORE pattern.
         regA[0] = *reinterpret_cast<const float4 *>(baseA + rowA * dk + colA);
         subA[rowA + colA * kLdSubA] = regA[0].x;
         subA[rowA + (colA + 1) * kLdSubA] = regA[0].y;
@@ -588,6 +676,7 @@ __global__ void gemmSmemWarpTile(const float * __restrict__ A,
         regB[0] = *reinterpret_cast<const float4 *>(baseB + rowB * dn + colB);
         *reinterpret_cast<float4 *>(&subB[tid * 4]) = regB[0];
 
+        // Until here.
         baseA += kBlockK;
         baseB += ldb8;
 
