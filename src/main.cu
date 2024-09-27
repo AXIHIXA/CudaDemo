@@ -212,7 +212,12 @@ __global__ void gemmSmem(const float * __restrict__ A,
     const float * __restrict__ baseA = A + by * dk;
     const float * __restrict__ baseB = B + bx;
 
-    // Index of ???
+    // Index of top-left corner of the region in C, handled by this thread.
+    // Note that y-span uses threadIdx.x, (i.e., threadIdx is transposed in C).
+    // This is the desired behavior.
+    // E.g., block (0, 0) thread (1, 0) reads a column in chunk A (row in subA), spanning from 8~15.
+    // And reads a row in chunk B, spanning from 0~7.
+    // These elements contribute to 8x8 block (x=0, y=1) (transposed order of threadIdx.x and .y!)
     float * __restrict__ baseC = C + (by + threadIdx.x * kThreadM) * dn + bx + threadIdx.y * kThreadN;
 
     // For chunk A (128, 8), each two threads load a whole row (of size 8).
@@ -232,8 +237,11 @@ __global__ void gemmSmem(const float * __restrict__ A,
 
     for (int i = 0; i < dk; i += kBlockK)
     {
-        // Each thread loads its float4 from matrix A into smem (but stores in COLUMN-major).
-        // That's because smemA will be accessed in column major afterward.
+        // Each thread loads its float4 from matrix A into SMEM,
+        // but stores in COLUMN-major, i.e., transposed.
+        // That's because subA will be accessed in column major afterward
+        // (the outer loop only executes for kBlockK == 8 times,
+        // so chunk A must be accessed in column major.)
         regA[0] = *reinterpret_cast<const float4 *>(baseA + i + rowA * dk + colA);
         subA[rowA + colA * kBlockM] = regA[0].x;
         subA[rowA + (colA + 1) * kBlockM] = regA[0].y;
@@ -253,6 +261,8 @@ __global__ void gemmSmem(const float * __restrict__ A,
             // Load subA by row. Note that subA stores A-chunk in column major (transposed).
             // So all threads in this thread block are bringing into register a whole column in A-chunk.
             // Each threads holds 8 floats in a column.
+            // Note that we only use threadIdx.x here, it's on purpose.
+            // There are multiple C-blocks requiring the same rows in A!
             regA[0] = *reinterpret_cast<float4 *>(&subA[ii * kBlockM + threadIdx.x * kThreadM]);
             regA[1] = *reinterpret_cast<float4 *>(&subA[ii * kBlockM + threadIdx.x * kThreadM + 4]);
 
@@ -388,7 +398,7 @@ __global__ void gemmSmemPad(const float * __restrict__ A,
     int rowB = (tid * 4) / kBlockN;  // each 32 threads load a row of 128 floats.
     int colB = (tid * 4) % kBlockN;  // column index of the 1st float to load, colB is a multiple of 4.
 
-    // Index of ???
+    // Index of C.
     int rowC = ((warpIdx >> 1 << 3) + (laneIdx & 3)) << 2;
     int colC = (((warpIdx & 1) << 4) + (laneIdx >> 2)) << 2;
     float * __restrict__ baseC = C + (by + rowC) * dn + bx + colC;
@@ -552,8 +562,7 @@ __global__ void gemmSmemWarpTile(const float * __restrict__ A,
     int rowB = (tid * 4) / kBlockN;  // each 32 threads load a row of 128 floats.
     int colB = (tid * 4) % kBlockN;  // column index of the 1st float to load, colB is a multiple of 4.
 
-    // Index of ???
-    // Warp tiling.
+    // Index of C with warp tiling.
     const int ldb8 = dn * 8;
     int rowC = ((warpIdx >> 1 << 2) + (laneIdx & 3)) << 3;
     int colC = (((warpIdx & 1) << 3) + (laneIdx >> 2)) << 3;
@@ -738,7 +747,8 @@ int main(int argc, char * argv[])
     {
         unsigned seed = std::random_device()();
         std::default_random_engine e(seed);
-        std::normal_distribution<float> d(0.0f, 1.0f);
+        // std::normal_distribution<float> d(0.0f, 1.0f);
+        std::uniform_int_distribution d(1, 20);
         auto g = [&e, &d]() -> float { return d(e); };
         std::generate(h_a.begin(), h_a.end(), g);
         std::generate(h_b.begin(), h_b.end(), g);
