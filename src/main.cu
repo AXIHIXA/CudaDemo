@@ -399,6 +399,8 @@ __global__ void gemmSmemPad(const float * __restrict__ A,
     int colB = (tid * 4) % kBlockN;  // column index of the 1st float to load, colB is a multiple of 4.
 
     // Index of C.
+    // Padding resolves bank conflicts on SMEM stores.
+    // The special warp tiling pattern handles bank conflicts on SMEM loads.
     int rowC = ((warpIdx >> 1 << 3) + (laneIdx & 3)) << 2;
     int colC = (((warpIdx & 1) << 4) + (laneIdx >> 2)) << 2;
     float * __restrict__ baseC = C + (by + rowC) * dn + bx + colC;
