@@ -2,15 +2,12 @@
 #define CUDA_UTILS_H
 
 
-inline constexpr int kCudaUtilsBufferSize = 1024;
-
-
 // AMGX API error checking
 #define AMGX_CHECK(err)                                                                            \
     do {                                                                                           \
         AMGX_RC err_ = (err);                                                                      \
         if (err_ != AMGX_RC_OK) {                                                                  \
-            char checkBuf[kCudaUtilsBufferSize] {'\0'};                                            \
+            char checkBuf[1024] = {'\0'};                                                          \
             std::sprintf(checkBuf, "AMGX error %d at %s:%d\n", err_, __FILE__, __LINE__);          \
             cudaDeviceReset();                                                                     \
             throw std::runtime_error(checkBuf);                                                    \
@@ -23,7 +20,7 @@ inline constexpr int kCudaUtilsBufferSize = 1024;
     do {                                                                                           \
         cublasStatus_t err_ = (err);                                                               \
         if (err_ != CUBLAS_STATUS_SUCCESS) {                                                       \
-            char checkBuf[kCudaUtilsBufferSize] {'\0'};                                            \
+            char checkBuf[1024] = {'\0'};                                                          \
             std::sprintf(checkBuf, "cuBLAS error %d at %s:%d\n", err_, __FILE__, __LINE__);        \
             cudaDeviceReset();                                                                     \
             throw std::runtime_error(checkBuf);                                                    \
@@ -36,7 +33,7 @@ inline constexpr int kCudaUtilsBufferSize = 1024;
     do {                                                                                           \
         cudaError_t err_ = (err);                                                                  \
         if (err_ != cudaSuccess) {                                                                 \
-            char checkBuf[kCudaUtilsBufferSize] {'\0'};                                            \
+            char checkBuf[1024] = {'\0'};                                                          \
             std::sprintf(checkBuf, "%s at %s:%d\n", cudaGetErrorString(err_), __FILE__, __LINE__); \
             cudaDeviceReset();                                                                     \
             throw std::runtime_error(checkBuf);                                                    \
@@ -49,7 +46,7 @@ inline constexpr int kCudaUtilsBufferSize = 1024;
     do {                                                                                           \
         cudaError_t err_ = cudaGetLastError();                                                     \
         if (err_ != cudaSuccess) {                                                                 \
-            char checkBuf[kCudaUtilsBufferSize] {'\0'};                                            \
+            char checkBuf[1024] = {'\0'};                                                          \
             std::sprintf(checkBuf, "%s at %s:%d\n", cudaGetErrorString(err_), __FILE__, __LINE__); \
             cudaDeviceReset();                                                                     \
             throw std::runtime_error(checkBuf);                                                    \
@@ -62,7 +59,7 @@ inline constexpr int kCudaUtilsBufferSize = 1024;
     do {                                                                                           \
         cusolverStatus_t err_ = (err);                                                             \
         if (err_ != CUSOLVER_STATUS_SUCCESS) {                                                     \
-            char checkBuf[kCudaUtilsBufferSize] {'\0'};                                            \
+            char checkBuf[1024] = {'\0'};                                                          \
             std::sprintf(checkBuf, "cuSOLVER error %d at %s:%d\n", err_, __FILE__, __LINE__);      \
             cudaDeviceReset();                                                                     \
             throw std::runtime_error(checkBuf);                                                    \
@@ -75,7 +72,7 @@ inline constexpr int kCudaUtilsBufferSize = 1024;
     do {                                                                                           \
         cusparseStatus_t err_ = (err);                                                             \
         if (err_ != CUSPARSE_STATUS_SUCCESS) {                                                     \
-            char checkBuf[kCudaUtilsBufferSize] {'\0'};                                            \
+            char checkBuf[1024] = {'\0'};                                                          \
             std::sprintf(checkBuf, "cuSPARSE error %d at %s:%d\n", err_, __FILE__, __LINE__);      \
             cudaDeviceReset();                                                                     \
             throw std::runtime_error(checkBuf);                                                    \

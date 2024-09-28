@@ -232,8 +232,8 @@ __global__ void gemmSmem(const float * __restrict__ A,
     float4 regA[kThreadM / 4] = {};
     float4 regB[kThreadN / 4] = {};
 
-    float c[kThreadM * kThreadN] = {};     // Intermediate register for A @ B.
-    float resC[kThreadM * kThreadN] = {};  // Intermediate register to load C and handle alpha beta.
+    // Intermediate register for A @ B.
+    float c[kThreadM * kThreadN] = {};
 
     for (int i = 0; i < dk; i += kBlockK)
     {
@@ -270,6 +270,12 @@ __global__ void gemmSmem(const float * __restrict__ A,
             // Each threads holds 8 floats in a column.
             // Note that we only use threadIdx.x here, it's on purpose.
             // There are multiple C-blocks requiring the same rows in A!
+
+            // Also note that the y-span for this block's C chunk is kBlockN == 128,
+            // each thread handles x-span of kBlockK == 8,
+            // so each element in subA should be read by 128/8==16 threads,
+            // so that the whole y-span in C chunk is covered.
+
             // Also note that this pattern has bank conflicts on loads from subA.
             // Each consecutive 8 threads have bank conflicts.
             // E.g., Block (0, 0), Threads (0, 0), (1, 0), (2, 0), (3, 0), (4, 0), ...
@@ -329,36 +335,18 @@ __global__ void gemmSmem(const float * __restrict__ A,
         }
     }
 
-    // Load the kThreadM x kThreadN (8x8) C-chunk into register.
     #pragma unroll
     for (int i = 0; i < kThreadM; ++i)
     {
         #pragma unroll
         for (int j = 0; j < kThreadN; j += 4)
         {
-            *reinterpret_cast<float4 *>(&resC[i * kThreadM + j]) = *reinterpret_cast<float4 *>(&baseC[i * dn + j]);
-        }
-    }
-
-    // Epilogue.
-    #pragma unroll
-    for (int i = 0; i < kThreadM; ++i)
-    {
-        #pragma unroll
-        for (int j = 0; j < kThreadN; ++j)
-        {
-            resC[i * kThreadM + j] = resC[i * kThreadM + j] * beta + alpha * c[i * kThreadM + j];
-        }
-    }
-
-    // Write-back.
-    #pragma unroll
-    for (int i = 0; i < kThreadM; ++i)
-    {
-        #pragma unroll
-        for (int j = 0; j < kThreadN; j += 4)
-        {
-            *reinterpret_cast<float4 *>(&baseC[i * dn + j]) = *reinterpret_cast<float4 *>(&resC[i * kThreadM + j]);
+            *reinterpret_cast<float4 *>(&regA[0]) = *reinterpret_cast<float4 *>(&baseC[i * dn + j]);
+            regA[0].x = regA[0].x * beta + alpha * c[i * kThreadM + j];
+            regA[0].y = regA[0].y * beta + alpha * c[i * kThreadM + j + 1];
+            regA[0].z = regA[0].z * beta + alpha * c[i * kThreadM + j + 2];
+            regA[0].w = regA[0].w * beta + alpha * c[i * kThreadM + j + 3];
+            *reinterpret_cast<float4 *>(&baseC[i * dn + j]) = *reinterpret_cast<float4 *>(&regA[0]);
         }
     }
 }
@@ -466,6 +454,9 @@ __global__ void gemmSmemPad(const float * __restrict__ A,
         // Each thread loads its float4 from matrix A into smem (but stores in COLUMN-major).
         // That's because smemA will be accessed in column major afterward.
         // Since we're writing SMEM in column major, we need to pad column to eliminate bank conflicts.
+        // Also note that the y-span for this block's C chunk is kBlockN == 128,
+        // each thread handles x-span of kBlockK == 8,
+        // so each element in subA should be read by 128/8==16 threads, so that the whole y-span in C chunk is covered.
         regA[0] = *reinterpret_cast<const float4 *>(baseA + i + rowA * dk + colA);
         subA[rowA + colA * kLdSubA] = regA[0].x;
         subA[rowA + (colA + 1) * kLdSubA] = regA[0].y;
@@ -636,7 +627,6 @@ __global__ void gemmSmemWarpTile(const float * __restrict__ A,
     int colB = (tid * 4) % kBlockN;  // column index of the 1st float to load, colB is a multiple of 4.
 
     // Index of C with warp tiling.
-    const int ldb8 = dn * 8;
 
     // Warp-side view:
     // All row/col indices offset by 8 per thread.
@@ -667,18 +657,14 @@ __global__ void gemmSmemWarpTile(const float * __restrict__ A,
     for (int i = 0; i < dk; i += kBlockK)
     {
         // Still the same SMEM STORE pattern.
-        regA[0] = *reinterpret_cast<const float4 *>(baseA + rowA * dk + colA);
+        regA[0] = *reinterpret_cast<const float4 *>(baseA + rowA * dk + colA + i);
         subA[rowA + colA * kLdSubA] = regA[0].x;
         subA[rowA + (colA + 1) * kLdSubA] = regA[0].y;
         subA[rowA + (colA + 2) * kLdSubA] = regA[0].z;
         subA[rowA + (colA + 3) * kLdSubA] = regA[0].w;
 
-        regB[0] = *reinterpret_cast<const float4 *>(baseB + rowB * dn + colB);
+        regB[0] = *reinterpret_cast<const float4 *>(baseB + (rowB + i) * dn + colB);
         *reinterpret_cast<float4 *>(&subB[tid * 4]) = regB[0];
-
-        // Until here.
-        baseA += kBlockK;
-        baseB += ldb8;
 
         __syncthreads();
 
