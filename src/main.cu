@@ -212,21 +212,31 @@ __global__ void gemmSmem(const float * __restrict__ A,
     const float * __restrict__ baseA = A + by * dk;
     const float * __restrict__ baseB = B + bx;
 
-    // Index of top-left corner of the region in C, handled by this thread.
-    // Note that y-span uses threadIdx.x, (i.e., threadIdx is transposed in C).
-    // This is the desired behavior.
-    // E.g., block (0, 0) thread (1, 0) reads a column in chunk A (row in subA), spanning from 8~15.
-    // And reads a row in chunk B, spanning from 0~7.
-    // These elements contribute to 8x8 block (x=0, y=1) (transposed order of threadIdx.x and .y!)
-    float * __restrict__ baseC = C + (by + threadIdx.x * kThreadM) * dn + bx + threadIdx.y * kThreadN;
-
     // For chunk A (128, 8), each two threads load a whole row (of size 8).
+    // Chunk A GMEM -> SMEM pattern:
+    //  baseA |  [0 1 2 3] [4 5 6 7] <- colA
+    // -------+---------------------
+    //   0    |     00        01
+    //   1    |     02        03
+    //   2    |     04        05
+    //   ...  |     ...       ...
+    //  rowA
+    // We will be loading rows but storing SMEM transposed (in columns),
+    // Thread #0 will conflict with thread #1, and $2 with $3, ...
     int rowA = (tid * 4) / kBlockK;  // each two threads load a row of 8 floats.
     int colA = (tid * 4) % kBlockK;  // column index of the 1st float to load, colA is a multiple of 4.
 
     // For chunk B (8, 128), each 32 threads load a whole row (of size 128).
     int rowB = (tid * 4) / kBlockN;  // each 32 threads load a row of 128 floats.
     int colB = (tid * 4) % kBlockN;  // column index of the 1st float to load, colB is a multiple of 4.
+
+    // Index of top-left corner of the region in C, handled by this thread.
+    // Note that y-span uses threadIdx.x, (i.e., threadIdx is transposed in C).
+    // This is the desired behavior.
+    // E.g., block (0, 0) thread (1, 0) reads a column in chunk A (row in subA), spanning from rows 8~15.
+    // And reads a row in chunk B, spanning from columns 0~7.
+    // These elements contribute to 8x8 block, but threadIdx.x contributes to ROW index, and threadIdx.y to COLUMN index!
+    float * __restrict__ baseC = C + (by + threadIdx.x * kThreadM) * dn + bx + threadIdx.y * kThreadN;
 
     // Intermediate registers for this thread's 8x8 elements.
     float4 regA[kThreadM / 4] = {};
@@ -355,20 +365,20 @@ __global__ void gemmSmem(const float * __restrict__ A,
 /// GEMM kernel calculating alpha * (A @ B) + beta * C.
 /// Utilizes SMEM,
 /// eliminates SMEM STORE bank conflicts via padding,
-/// and SMEM LOAD bank conflicts via warp tiling.
+/// and SMEM LOAD bank conflicts via transposed warp tiling.
 /// Also uses vectorized loads/stores (GMEM <-> REG <-> SMEM) via float4.
 /// \param[in] A      shape=(dm, dk)
 /// \param[in] B      shape=(dk, dn)
 /// \param[in/out] C  shape=(dm, dn)
 template <int kBlockSize, int kBlockM, int kBlockN, int kBlockK, int kPadding = 4>
-__global__ void gemmSmemPad(const float * __restrict__ A,
-                            const float * __restrict__ B,
-                            float * __restrict__ C,
-                            int dm,
-                            int dn,
-                            int dk,
-                            float alpha,
-                            float beta)
+__global__ void gemmSmemPadTransposedThread(const float * __restrict__ A,
+                                            const float * __restrict__ B,
+                                            float * __restrict__ C,
+                                            int dm,
+                                            int dn,
+                                            int dk,
+                                            float alpha,
+                                            float beta)
 {
     // Pad by 4 to align float4 loads/stores.
     static_assert(kBlockSize == 16 &&
@@ -419,8 +429,8 @@ __global__ void gemmSmemPad(const float * __restrict__ A,
     // The special transposed warp tiling pattern resolves bank conflicts on SMEM loads.
     // Warp-side view:
     // All row/col indices offset by 4 per thread.
-    //       0   4   8  12  16  20  24  28
-    //    +-------------------------------
+    //    |  0   4   8  12  16  20  24  28
+    // ---+-------------------------------
     //  0 | 00  04  08  12  16  20  24  28
     //  4 | 01  05  09  13  17  21  25  29
     //  8 | 02  06  10  14  18  22  26  30
@@ -568,8 +578,223 @@ __global__ void gemmSmemPad(const float * __restrict__ A,
 
 /// GEMM kernel calculating alpha * (A @ B) + beta * C.
 /// Utilizes SMEM,
-/// eliminates SMEM LOAD bank conflicts via warp tiling,
-/// (but leaving SMEM STORE bank conflicts as-is).
+/// eliminates SMEM STORE bank conflicts via padding,
+/// and SMEM LOAD bank conflicts via warp tiling (z-threads).
+/// The only difference with TransposedThread is the rowC/colC indices.
+/// Also uses vectorized loads/stores (GMEM <-> REG <-> SMEM) via float4.
+/// \param[in] A      shape=(dm, dk)
+/// \param[in] B      shape=(dk, dn)
+/// \param[in/out] C  shape=(dm, dn)
+template <int kBlockSize, int kBlockM, int kBlockN, int kBlockK, int kPadding = 4>
+__global__ void gemmSmemPadZThread(const float * __restrict__ A,
+                                   const float * __restrict__ B,
+                                   float * __restrict__ C,
+                                   int dm,
+                                   int dn,
+                                   int dk,
+                                   float alpha,
+                                   float beta)
+{
+    // Pad by 4 to align float4 loads/stores.
+    static_assert(kBlockSize == 16 &&
+                  kBlockM == 128 && (kBlockM % kBlockSize == 0) &&
+                  kBlockN == 128 && (kBlockN % kBlockSize == 0) &&
+                  kBlockK == 8 &&
+                  kPadding == 4,
+                  "At present, we only tested the specified combination.");
+
+    // The x-span (N) and y-span (M) of this thread.
+    // This thread computes (kThreadM, kThreadN) elements in the output matrix shaped (dm, dn).
+    constexpr int kThreadM = kBlockM / kBlockSize;
+    constexpr int kThreadN = kBlockN / kBlockSize;
+
+    // Top-left corner of this thread block's elements in C.
+    int bx = blockIdx.x * kBlockN;
+    int by = blockIdx.y * kBlockM;
+
+    // Indexes.
+    int tid = threadIdx.y * kBlockSize + threadIdx.x;  // Index of this thread in the parent thread block.
+    int laneIdx = tid % 32;
+    int warpIdx = tid / 32;
+
+    // Read A and B chunks into smem.
+    // A chunk has shape (kBlockM, kBlockK) == (128, 8).
+    // B chunk has shape (kBlockK, kBlockN) == (8, 128).
+    // While a hread block has shape (kBlockSize, kBlockSize) == (16, 16).
+    // Thus, each thread should load a float4 from A, and another float4 from B.
+    // Padding resolves bank conflicts on SMEM stores.
+    constexpr int kLdSubA = kBlockM + kPadding;
+    __shared__ float subA[kLdSubA * kBlockK];
+    __shared__ float subB[kBlockK * kBlockN];
+
+    // Indices of the 1st element in A and B handled by this thread block.
+    const float * __restrict__ baseA = A + by * dk;
+    const float * __restrict__ baseB = B + bx;
+
+    // For chunk A (128, 8), each two threads load a whole row (of size 8).
+    int rowA = (tid * 4) / kBlockK;  // each two threads load a row of 8 floats.
+    int colA = (tid * 4) % kBlockK;  // column index of the 1st float to load, colA is a multiple of 4.
+
+    // For chunk B (8, 128), each 32 threads load a whole row (of size 128).
+    int rowB = (tid * 4) / kBlockN;  // each 32 threads load a row of 128 floats.
+    int colB = (tid * 4) % kBlockN;  // column index of the 1st float to load, colB is a multiple of 4.
+
+    // Index of C.
+    // Padding resolves bank conflicts on SMEM stores.
+    // The special [z-shaped] (an alternative to TRANSPOSED) warp tiling pattern resolves bank conflicts on SMEM loads.
+    // Warp-side view:
+    // All row/col indices offset by 4 per thread.
+    //    |  0   4    8  12   16  20   24  28
+    // ---+--------+--------+-----------------
+    //  0 | 00  02 | 04  06 | 08  10 | 12  14
+    //  4 | 01  03 | 05  07 | 09  11 | 13  15
+    //    |--------+--------+--------+--------
+    //  8 | 16  18 | 20  22 | 24  26 | 28  30
+    // 12 | 17  19 | 21  23 | 25  27 | 29  31
+    // A thread will no longer handle a 8x8 submatrix in C.
+    // it handles four 4x4 submatrices located (top-left-corner's linear index in C)
+    // at baseC, baseC + 32, baseC + 16 * dn, baseC + 16 * dn + 32, in a loop[1...4].
+    // Block-side view:
+    //     baseC  [ 0  31]  [32  63]  [64  95]  [96 127]
+    //  [ 0  15]  [Warp 0]  [Warp  ]  [Warp 1]  [Warp  ]
+    //  [16  31]  [Warp  ]  [Warp  ]  [Warp  ]  [Warp  ]
+    //  [32  47]  [Warp 2]  [Warp  ]  [Warp 3]  [Warp  ]
+    //  [48  63]  [Warp  ]  [Warp  ]  [Warp  ]  [Warp  ]
+    //  [64  79]  [Warp 4]  [Warp  ]  [Warp 5]  [Warp  ]
+    //  [80  95]  [Warp  ]  [Warp  ]  [Warp  ]  [Warp  ]
+    //  [96 111]  [Warp 6]  [Warp  ]  [Warp 7]  [Warp  ]
+    // [112 127]  [Warp  ]  [Warp  ]  [Warp  ]  [Warp  ]
+    int rowC = ((warpIdx >> 1 << 3) + ((laneIdx >> 4) << 1) + (laneIdx & 1)) << 2;
+    int colC = (((warpIdx & 1) << 4) + ((laneIdx & 15) >> 1)) << 2;
+    float * __restrict__ baseC = C + (by + rowC) * dn + bx + colC;
+
+    // Intermediate registers for this thread's 8x8 elements.
+    float4 regA[kThreadM / 4] = {};
+    float4 regB[kThreadN / 4] = {};
+
+    // Intermediate results.
+    float c[kThreadM * kThreadN] = {};
+
+    for (int i = 0; i < dk; i += kBlockK)
+    {
+        // Each thread loads its float4 from matrix A into smem (but stores in COLUMN-major).
+        // That's because smemA will be accessed in column major afterward.
+        // Since we're writing SMEM in column major, we need to pad column to eliminate bank conflicts.
+        // Also note that the y-span for this block's C chunk is kBlockN == 128,
+        // each thread handles x-span of kBlockK == 8,
+        // so each element in subA should be read by 128/8==16 threads, so that the whole y-span in C chunk is covered.
+        regA[0] = *reinterpret_cast<const float4 *>(baseA + i + rowA * dk + colA);
+        subA[rowA + colA * kLdSubA] = regA[0].x;
+        subA[rowA + (colA + 1) * kLdSubA] = regA[0].y;
+        subA[rowA + (colA + 2) * kLdSubA] = regA[0].z;
+        subA[rowA + (colA + 3) * kLdSubA] = regA[0].w;
+
+        // Each thread loads its float4 from matrix B into smem.
+        // Because the SMEM stores are coalesced, there's natually no bank conflict.
+        regB[0] = *reinterpret_cast<const float4 *>(baseB + (i + rowB) * dn + colB);
+        *reinterpret_cast<float4 *>(&subB[tid * 4]) = regB[0];
+
+        // So all data needed for this tile on dim K are loaded into SMEM.
+        __syncthreads();
+
+        // So the SMEM stores are indentical to naive SMEM kernel, except the padding.
+
+        #pragma unroll
+        for (int ii = 0; ii < kBlockK; ++ii)
+        {
+            // No bank conflict this time.
+            // But since regA[0...1] does not hold consecutive 8 floats,
+            // the results need to be stored to somewhere else (strided...)
+            // E.g., block (0, 0), thread (0, 0), (1, 0), (2, 0), (3, 0), ...
+            // subA   0   4   8  12  0  4  8  12 (broadcast, no bank conflict)
+            regA[0] = *reinterpret_cast<float4 *>(&subA[ii * kLdSubA + rowC]);
+            // subA  16  20  24  28  16  20  24  28 (broadcast, no bank conflict)
+            regA[1] = *reinterpret_cast<float4 *>(&subA[ii * kLdSubA + rowC + 16]);
+            // subB   0   0   0   0   4   4   4   4 (broadcast, no bank conflict)
+            regB[0] = *reinterpret_cast<float4 *>(&subB[ii * kBlockN + colC]);
+            // subB  32(0) 32(0) 32(0) 32(0) 36(4) 36(4) 36(4) 36(4) (broadcast, no bank conflict)
+            regB[1] = *reinterpret_cast<float4 *>(&subB[ii * kBlockN + colC + 32]);
+
+            // c is a kThreadM * kThreadN (8x8) block, SAME AS SmemNaive.
+            //     0                 3   4                 7
+            // 0   regA[0].x * regB[0]   regA[0].x * regB[1]
+            // 1   regA[0].y * regB[0]   regA[0].x * regB[1]
+            // 2   regA[0].z * regB[0]   regA[0].x * regB[1]
+            // 3   regA[0].w * regB[0]   regA[0].x * regB[1]
+            // 4   regA[1].x * regB[0]   regA[1].x * regB[1]
+            // 5   regA[1].y * regB[0]   regA[1].x * regB[1]
+            // 6   regA[1].z * regB[0]   regA[1].x * regB[1]
+            // 7   regA[1].w * regB[0]   regA[1].x * regB[1]
+
+            #pragma unroll
+            for (int cpi = 0; cpi < kThreadM / 4; ++cpi)
+            {
+                #pragma unroll
+                for (int cpj = 0; cpj < kThreadN / 4; ++cpj)
+                {
+                    c[cpi * 4 * kThreadM + cpj * 4] += regA[cpi].x * regB[cpj].x;
+                    c[cpi * 4 * kThreadM + cpj * 4 + 1] += regA[cpi].x * regB[cpj].y;
+                    c[cpi * 4 * kThreadM + cpj * 4 + 2] += regA[cpi].x * regB[cpj].z;
+                    c[cpi * 4 * kThreadM + cpj * 4 + 3] += regA[cpi].x * regB[cpj].w;
+
+                    c[(cpi * 4 + 1) * kThreadM + cpj * 4] += regA[cpi].y * regB[cpj].x;
+                    c[(cpi * 4 + 1) * kThreadM + cpj * 4 + 1] += regA[cpi].y * regB[cpj].y;
+                    c[(cpi * 4 + 1) * kThreadM + cpj * 4 + 2] += regA[cpi].y * regB[cpj].z;
+                    c[(cpi * 4 + 1) * kThreadM + cpj * 4 + 3] += regA[cpi].y * regB[cpj].w;
+
+                    c[(cpi * 4 + 2) * kThreadM + cpj * 4] += regA[cpi].z * regB[cpj].x;
+                    c[(cpi * 4 + 2) * kThreadM + cpj * 4 + 1] += regA[cpi].z * regB[cpj].y;
+                    c[(cpi * 4 + 2) * kThreadM + cpj * 4 + 2] += regA[cpi].z * regB[cpj].z;
+                    c[(cpi * 4 + 2) * kThreadM + cpj * 4 + 3] += regA[cpi].z * regB[cpj].w;
+
+                    c[(cpi * 4 + 3) * kThreadM + cpj * 4] += regA[cpi].w * regB[cpj].x;
+                    c[(cpi * 4 + 3) * kThreadM + cpj * 4 + 1] += regA[cpi].w * regB[cpj].y;
+                    c[(cpi * 4 + 3) * kThreadM + cpj * 4 + 2] += regA[cpi].w * regB[cpj].z;
+                    c[(cpi * 4 + 3) * kThreadM + cpj * 4 + 3] += regA[cpi].w * regB[cpj].w;
+                }
+            }
+
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        *reinterpret_cast<float4 *>(&regA[0]) = *reinterpret_cast<float4 *>(&baseC[i * dn]);
+        regA[0].x = regA[0].x * beta + alpha * c[i * kThreadN];
+        regA[0].y = regA[0].y * beta + alpha * c[1 + i * kThreadN];
+        regA[0].z = regA[0].z * beta + alpha * c[2 + i * kThreadN];
+        regA[0].w = regA[0].w * beta + alpha * c[3 + i * kThreadN];
+        *reinterpret_cast<float4 *>(&baseC[i * dn]) = *reinterpret_cast<float4 *>(&regA[0]);
+
+        *reinterpret_cast<float4 *>(&regA[0]) = *reinterpret_cast<float4 *>(&baseC[i * dn + 32]);
+        regA[0].x = regA[0].x * beta + alpha * c[4 + i * kThreadN];
+        regA[0].y = regA[0].y * beta + alpha * c[5 + i * kThreadN];
+        regA[0].z = regA[0].z * beta + alpha * c[6 + i * kThreadN];
+        regA[0].w = regA[0].w * beta + alpha * c[7 + i * kThreadN];
+        *reinterpret_cast<float4 *>(&baseC[i * dn + 32]) = *reinterpret_cast<float4 *>(&regA[0]);
+
+        *reinterpret_cast<float4 *>(&regA[0]) = *reinterpret_cast<float4 *>(&baseC[(i + 16) * dn]);
+        regA[0].x = regA[0].x * beta + alpha * c[32 + i * kThreadN];
+        regA[0].y = regA[0].y * beta + alpha * c[33 + i * kThreadN];
+        regA[0].z = regA[0].z * beta + alpha * c[34 + i * kThreadN];
+        regA[0].w = regA[0].w * beta + alpha * c[35 + i * kThreadN];
+        *reinterpret_cast<float4 *>(&baseC[(i + 16) * dn]) = *reinterpret_cast<float4 *>(&regA[0]);
+
+        *reinterpret_cast<float4 *>(&regA[0]) = *reinterpret_cast<float4 *>(&baseC[(i + 16) * dn + 32]);
+        regA[0].x = regA[0].x * beta + alpha * c[36 + i * kThreadN];
+        regA[0].y = regA[0].y * beta + alpha * c[37 + i * kThreadN];
+        regA[0].z = regA[0].z * beta + alpha * c[38 + i * kThreadN];
+        regA[0].w = regA[0].w * beta + alpha * c[39 + i * kThreadN];
+        *reinterpret_cast<float4 *>(&baseC[(i + 16) * dn + 32]) = *reinterpret_cast<float4 *>(&regA[0]);
+    }
+}
+
+
+/// GEMM kernel calculating alpha * (A @ B) + beta * C.
+/// Utilizes SMEM,
+/// eliminates SMEM bank conflicts (STORES AND LOADS) via warp tiling.
 /// Also uses vectorized loads/stores (GMEM <-> REG <-> SMEM) via float4.
 /// \param[in] A      shape=(dm, dk)
 /// \param[in] B      shape=(dk, dn)
@@ -618,7 +843,30 @@ __global__ void gemmSmemWarpTile(const float * __restrict__ A,
     const float * __restrict__ baseA = A + by * dk;
     const float * __restrict__ baseB = B + bx;
 
-    // For chunk A (128, 8), each two threads load a whole row (of size 8).
+    // For chunk A (128, 8), each row (of size 8) needs two threads to load.
+    // However, to avoid STORE bank conflicts, we do NOT let consecutive threads-of-twos to load a row.
+    // Chunk A GMEM -> SMEM pattern:
+    //  baseA |  [0 1 2 3] [4 5 6 7] <- colA
+    // -------+---------------------
+    //   0    |     00        32
+    //   1    |     01        33
+    //   ...  |     ...       ...
+    //   31   |     31        63
+    // -------+---------------------
+    //   32   |     64        80
+    //   33   |     65        33
+    //   ...  |     ...       ...
+    //   63   |     79        95
+    //   ...  |     ...       ...
+    //  rowA
+    // We will STILL be loading rows but storing SMEM transposed (in columns).
+    // But with this thread arrangement, we won't have SMEM STORE bank conflicts.
+    // // int rowA = 32 * (warpIdx / 2) + laneIdx % 32;
+    // // int colA = ((tid / 32) & 1) * 4;
+
+    // The naive GMEM -> SMEM pattern.
+    // This pattern has SMEM STORE bank conflicts but has slightly better performance that the no-bank-conflict version.
+    // The cause should be the bank-conflict version has higher gld_efficiency.
     int rowA = (tid * 4) / kBlockK;  // each two threads load a row of 8 floats.
     int colA = (tid * 4) % kBlockK;  // column index of the 1st float to load, colA is a multiple of 4.
 
@@ -627,11 +875,10 @@ __global__ void gemmSmemWarpTile(const float * __restrict__ A,
     int colB = (tid * 4) % kBlockN;  // column index of the 1st float to load, colB is a multiple of 4.
 
     // Index of C with warp tiling.
-
     // Warp-side view:
     // All row/col indices offset by 8 per thread.
-    //       0   8  16  24  32  40  48  56
-    //    +-------------------------------
+    //    |  0   8  16  24  32  40  48  56
+    // ---+-------------------------------
     //  0 | 00  04  08  12  16  20  24  28
     //  8 | 01  05  09  13  17  21  25  29
     // 16 | 02  06  10  14  18  22  26  30
@@ -656,8 +903,8 @@ __global__ void gemmSmemWarpTile(const float * __restrict__ A,
 
     for (int i = 0; i < dk; i += kBlockK)
     {
-        // Still the same SMEM STORE pattern.
-        regA[0] = *reinterpret_cast<const float4 *>(baseA + rowA * dk + colA + i);
+        // Warp-tiled SMEM STORE pattern as specified above.
+        regA[0] = *reinterpret_cast<const float4 *>(baseA + i + rowA * dk + colA);
         subA[rowA + colA * kLdSubA] = regA[0].x;
         subA[rowA + (colA + 1) * kLdSubA] = regA[0].y;
         subA[rowA + (colA + 2) * kLdSubA] = regA[0].z;
@@ -800,7 +1047,8 @@ int main(int argc, char * argv[])
 
     constexpr bool kTestGemmNaive = false;  // Takes too long for m=n=k=4096.
     constexpr bool kTestGemmSmem = true;
-    constexpr bool kTestGemmSmemPad = true;
+    constexpr bool kTestGemmSmemPadTransposedThread = true;
+    constexpr bool kTestGemmSmemPadZThread = true;
     constexpr bool kTestGemmWarpTile = true;
     constexpr bool kTestCublasSGemm = true;
 
@@ -808,7 +1056,6 @@ int main(int argc, char * argv[])
     // Tested on NVIDIA Geforce RTX 2080 Ti (kDup=100, kRandInput=true),
     // gemmSmemPad reaches 80% cublasSgemm performance on m=n=k=2048,
     //                     90% cublasSgemm performance on m=n=k=4096.
-    // under CUBLAS_TF32_TENSOR_OP_MATH tensor mode.
     // It shows that CUBLAS_DEFAULT_MATH defaults to CUBLAS_TF32_TENSOR_OP_MATH.
     int problemSize = 1024;
     int m = problemSize;
@@ -873,19 +1120,19 @@ int main(int argc, char * argv[])
     if constexpr (kTestGemmNaive)
     {
         if constexpr (1 < kDup)
-    {
-        gemmNaive<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
-                thrust::raw_pointer_cast(d_a.data()),
-                thrust::raw_pointer_cast(d_b.data()),
-                thrust::raw_pointer_cast(d_c.data()),
-                m,
-                n,
-                k,
-                alpha,
-                beta
-        );
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
+        {
+            gemmNaive<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
+                    thrust::raw_pointer_cast(d_a.data()),
+                    thrust::raw_pointer_cast(d_b.data()),
+                    thrust::raw_pointer_cast(d_c.data()),
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
 
         d_c = h_c;
         CUDA_CHECK(cudaEventRecord(ss));
@@ -893,14 +1140,14 @@ int main(int argc, char * argv[])
         for (int dup = 0; dup < kDup; ++dup)
         {
             gemmNaive<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
-                thrust::raw_pointer_cast(d_a.data()),
-                thrust::raw_pointer_cast(d_b.data()),
-                thrust::raw_pointer_cast(d_c.data()),
-                m,
-                n,
-                k,
-                alpha,
-                beta
+                    thrust::raw_pointer_cast(d_a.data()),
+                    thrust::raw_pointer_cast(d_b.data()),
+                    thrust::raw_pointer_cast(d_c.data()),
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta
             );
         }
 
@@ -927,19 +1174,19 @@ int main(int argc, char * argv[])
     if constexpr (kTestGemmSmem)
     {
         if constexpr (1 < kDup)
-    {
-        gemmSmem<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
-                thrust::raw_pointer_cast(d_a.data()),
-                thrust::raw_pointer_cast(d_b.data()),
-                thrust::raw_pointer_cast(d_c.data()),
-                m,
-                n,
-                k,
-                alpha,
-                beta
-        );
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
+        {
+            gemmSmem<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
+                    thrust::raw_pointer_cast(d_a.data()),
+                    thrust::raw_pointer_cast(d_b.data()),
+                    thrust::raw_pointer_cast(d_c.data()),
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
 
         d_c = h_c;
         CUDA_CHECK(cudaEventRecord(ss));
@@ -947,14 +1194,14 @@ int main(int argc, char * argv[])
         for (int dup = 0; dup < kDup; ++dup)
         {
             gemmSmem<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
-                thrust::raw_pointer_cast(d_a.data()),
-                thrust::raw_pointer_cast(d_b.data()),
-                thrust::raw_pointer_cast(d_c.data()),
-                m,
-                n,
-                k,
-                alpha,
-                beta
+                    thrust::raw_pointer_cast(d_a.data()),
+                    thrust::raw_pointer_cast(d_b.data()),
+                    thrust::raw_pointer_cast(d_c.data()),
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta
             );
         }
 
@@ -978,11 +1225,11 @@ int main(int argc, char * argv[])
     }
 
     // Smem with Padding
-    if constexpr (kTestGemmSmemPad)
+    if constexpr (kTestGemmSmemPadTransposedThread)
     {
         if constexpr (1 < kDup)
         {
-            gemmSmemPad<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
+            gemmSmemPadTransposedThread<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
                     thrust::raw_pointer_cast(d_a.data()),
                     thrust::raw_pointer_cast(d_b.data()),
                     thrust::raw_pointer_cast(d_c.data()),
@@ -1000,15 +1247,15 @@ int main(int argc, char * argv[])
 
         for (int dup = 0; dup < kDup; ++dup)
         {
-            gemmSmemPad<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
-                thrust::raw_pointer_cast(d_a.data()),
-                thrust::raw_pointer_cast(d_b.data()),
-                thrust::raw_pointer_cast(d_c.data()),
-                m,
-                n,
-                k,
-                alpha,
-                beta
+            gemmSmemPadTransposedThread<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
+                    thrust::raw_pointer_cast(d_a.data()),
+                    thrust::raw_pointer_cast(d_b.data()),
+                    thrust::raw_pointer_cast(d_c.data()),
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta
             );
         }
 
@@ -1017,7 +1264,61 @@ int main(int argc, char * argv[])
         CUDA_CHECK(cudaEventRecord(ee));
         CUDA_CHECK(cudaEventSynchronize(ee));
 
-        std::printf("gemmSmemPad: ");
+        std::printf("gemmSmemPadTransposedThread: ");
+        CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
+        std::printf("took %f ms, ", ms / kDup);
+
+        if constexpr (1 == kDup)
+        {
+            checkResult(d_c, golden_c, m, n);
+        }
+        else
+        {
+            std::printf("\n");
+        }
+    }
+
+    // Smem with Padding and z-thread in-warp layout
+    if constexpr (kTestGemmSmemPadZThread)
+    {
+        if constexpr (1 < kDup)
+        {
+            gemmSmemPadZThread<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
+                    thrust::raw_pointer_cast(d_a.data()),
+                    thrust::raw_pointer_cast(d_b.data()),
+                    thrust::raw_pointer_cast(d_c.data()),
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        d_c = h_c;
+        CUDA_CHECK(cudaEventRecord(ss));
+
+        for (int dup = 0; dup < kDup; ++dup)
+        {
+            gemmSmemPadZThread<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
+                    thrust::raw_pointer_cast(d_a.data()),
+                    thrust::raw_pointer_cast(d_b.data()),
+                    thrust::raw_pointer_cast(d_c.data()),
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta
+            );
+        }
+
+        CUDA_CHECK_LAST_ERROR();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaEventRecord(ee));
+        CUDA_CHECK(cudaEventSynchronize(ee));
+
+        std::printf("gemmSmemPadZThread: ");
         CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
         std::printf("took %f ms, ", ms / kDup);
 
@@ -1089,20 +1390,20 @@ int main(int argc, char * argv[])
     if constexpr (kTestCublasSGemm)
     {
         if constexpr (1 < kDup)
-    {
-        gemmCublas(
-                thrust::raw_pointer_cast(d_a.data()),
-                thrust::raw_pointer_cast(d_b.data()),
-                thrust::raw_pointer_cast(d_c.data()),
-                m,
-                n,
-                k,
-                alpha,
-                beta,
-                handle
-        );
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
+        {
+            gemmCublas(
+                    thrust::raw_pointer_cast(d_a.data()),
+                    thrust::raw_pointer_cast(d_b.data()),
+                    thrust::raw_pointer_cast(d_c.data()),
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta,
+                    handle
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
 
         d_c = h_c;
         CUDA_CHECK(cudaEventRecord(ss));
@@ -1110,15 +1411,15 @@ int main(int argc, char * argv[])
         for (int dup = 0; dup < kDup; ++dup)
         {
             gemmCublas(
-                thrust::raw_pointer_cast(d_a.data()),
-                thrust::raw_pointer_cast(d_b.data()),
-                thrust::raw_pointer_cast(d_c.data()),
-                m,
-                n,
-                k,
-                alpha,
-                beta,
-                handle
+                    thrust::raw_pointer_cast(d_a.data()),
+                    thrust::raw_pointer_cast(d_b.data()),
+                    thrust::raw_pointer_cast(d_c.data()),
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta,
+                    handle
             );
         }
 
