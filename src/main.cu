@@ -230,6 +230,22 @@ __global__ void gemmSmem(const float * __restrict__ A,
     int rowB = (tid * 4) / kBlockN;  // each 32 threads load a row of 128 floats.
     int colB = (tid * 4) % kBlockN;  // column index of the 1st float to load, colB is a multiple of 4.
 
+    // Region-of-C to write.
+    // Warp-side view:
+    // All row/col indices offset by 8 per thread.
+    // So this pattern will have SMEM LOAD conflicts.
+    //      |  0    8
+    // -----+-----------
+    //    0 | 00   16
+    //    8 | 01   17
+    //   16 | 02   18
+    //  ... | ...  ...
+    //  120 | 15   31
+    // A thread will handle a 8x8 submatrix in C.
+    // Block-side view:
+    //     baseC  [ 0  16]  [17  31]  ... [96 111]  [112 127]
+    // [  0 127]  [Warp 0]  [Warp 1]  ... [Warp 6]  [Warp  7]
+
     // Index of top-left corner of the region in C, handled by this thread.
     // Note that y-span uses threadIdx.x, (i.e., threadIdx is transposed in C).
     // This is the desired behavior.
