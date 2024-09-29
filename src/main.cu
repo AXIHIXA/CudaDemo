@@ -989,6 +989,248 @@ __global__ void gemmSmemWarpTile(const float * __restrict__ A,
 }
 
 
+/// GEMM kernel calculating alpha * (A @ B) + beta * C.
+/// Ultimate version with double buffer optimization.
+/// \param[in] A      shape=(dm, dk)
+/// \param[in] B      shape=(dk, dn)
+/// \param[in/out] C  shape=(dm, dn)
+template <int kBlockSize, int kBlockM, int kBlockN, int kBlockK, int kPadding = 4>
+__global__ void gemmSmemDoubleBuffer(const float * __restrict__ A,
+                                     const float * __restrict__ B,
+                                     float * __restrict__ C,
+                                     int dm,
+                                     int dn,
+                                     int dk,
+                                     float alpha,
+                                     float beta)
+{
+    static_assert(kBlockSize == 16 &&
+                  kBlockM == 128 && (kBlockM % kBlockSize == 0) &&
+                  kBlockN == 128 && (kBlockN % kBlockSize == 0) &&
+                  kBlockK == 8 &&
+                  kPadding == 4,
+                  "At present, we only tested the specified combination.");
+
+    constexpr int kThreadM = kBlockM / kBlockSize;
+    constexpr int kThreadN = kBlockN / kBlockSize;
+
+    int bx = blockIdx.x * blockDim.x * kThreadM;
+    int by = blockIdx.y * blockDim.y * kThreadN;
+
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int warpIdx = tid >> 5;
+    int laneIdx = tid & 31;
+
+    __shared__ __align__(16 * 1024) char smem[6 * 4 * 1024];
+    constexpr int ldSubA = kBlockM + kPadding;
+    auto subA = reinterpret_cast<float *>(smem);
+    auto subB = reinterpret_cast<float *>(smem + 4 * 4 * 1024);
+
+    int rowA = tid >> 1;
+    int rowB = tid >> 5;
+    int colA = (tid & 1) << 2;
+    int colB = tid & 31;
+
+    const float * baseA = A + by * dk;
+    const float * baseB = B + bx;
+
+    // Z-tiling for lanes in warp.
+    int rowC = ((warpIdx >> 1 << 3) + ((laneIdx >> 4) << 1) + (laneIdx & 1)) << 2;
+    int colC = (((warpIdx & 1) << 4) + ((laneIdx & 15) >> 1)) << 2;
+    float *baseC = C + (by + rowC) * dn + bx + colC;
+
+    // Double buffer.
+    float4 preA;
+    float4 preB;
+
+    float4 regA[2][kThreadM / 4];
+    float4 regB[2][kThreadM / 4];
+
+    // 1st prefetch.
+    preA = *reinterpret_cast<const float4 *>(baseA + rowA * dk + colA);
+
+    preB.x = baseB[rowB * dn + colB];
+    preB.y = baseB[rowB * dn + colB + 32];
+    preB.z = baseB[rowB * dn + colB + 32 * 2];
+    preB.w = baseB[rowB * dn + colB + 32 * 3];
+
+    subA[rowA + colA * ldSubA] = preA.x;
+    subA[rowA + (colA + 1) * ldSubA] = preA.y;
+    subA[rowA + (colA + 2) * ldSubA] = preA.z;
+    subA[rowA + (colA + 3) * ldSubA] = preA.w;
+
+    subB[(tid / 32) * kBlockN + (tid & 31)] = preB.x;
+    subB[(tid / 32) * kBlockN + (tid & 31) + 32] = preB.y;
+    subB[(tid / 32) * kBlockN + (tid & 31) + 32 * 2] = preB.z;
+    subB[(tid / 32) * kBlockN + (tid & 31) + 32 * 3] = preB.w;
+
+    __syncthreads();
+
+    regA[0][0] = *reinterpret_cast<float4 *>(&subA[rowC]);
+    regA[0][1] = *reinterpret_cast<float4 *>(&subA[rowC + 16]);
+
+    regB[0][0] = *reinterpret_cast<float4 *>(&subB[colC]);
+    regB[0][1] = *reinterpret_cast<float4 *>(&subB[colC + 32]);
+
+    float c[kThreadM * kThreadN] = {};
+
+    // Streamlined loads & computation.
+    for (int i = kBlockK; i < dk; i += kBlockK)
+    {
+        preA = *reinterpret_cast<const float4 *>(baseA + i + rowA * dk + colA);
+
+        preB.x = baseB[rowB * dn + i * dn + colB];
+        preB.y = baseB[rowB * dn + i * dn + colB + 32];
+        preB.z = baseB[rowB * dn + i * dn + colB + 32 * 2];
+        preB.w = baseB[rowB * dn + i * dn + colB + 32 * 3];
+
+        #pragma unroll
+        for (int ii = 0; ii < kBlockK; ii++)
+        {
+            if (ii != 7)
+            {
+                regB[(ii + 1) & 1][0] = *reinterpret_cast<float4 *>(&subB[colC + kBlockN * (ii + 1)]);
+                regB[(ii + 1) & 1][1] = *reinterpret_cast<float4 *>(&subB[colC + 32 + kBlockN * (ii + 1)]);
+
+                regA[(ii + 1) & 1][0] = *reinterpret_cast<float4 *>(&subA[rowC + (ii + 1) * ldSubA]);
+                regA[(ii + 1) & 1][1] = *reinterpret_cast<float4 *>(&subA[(rowC + 16) + (ii + 1) * ldSubA]);
+            }
+
+            #pragma unroll
+            for (int cpi = 0; cpi < kThreadM / 4; ++cpi)
+            {
+                #pragma unroll
+                for (int cpj = 0; cpj < kThreadN / 4; ++cpj)
+                {
+                    c[cpi * 4 * kThreadM + cpj * 4] += regA[ii & 1][cpi].x * regB[ii & 1][cpj].x;
+                    c[cpi * 4 * kThreadM + cpj * 4 + 1] += regA[ii & 1][cpi].x * regB[ii & 1][cpj].y;
+                    c[cpi * 4 * kThreadM + cpj * 4 + 2] += regA[ii & 1][cpi].x * regB[ii & 1][cpj].z;
+                    c[cpi * 4 * kThreadM + cpj * 4 + 3] += regA[ii & 1][cpi].x * regB[ii & 1][cpj].w;
+
+                    c[(cpi * 4 + 1) * kThreadM + cpj * 4] += regA[ii & 1][cpi].y * regB[ii & 1][cpj].x;
+                    c[(cpi * 4 + 1) * kThreadM + cpj * 4 + 1] += regA[ii & 1][cpi].y * regB[ii & 1][cpj].y;
+                    c[(cpi * 4 + 1) * kThreadM + cpj * 4 + 2] += regA[ii & 1][cpi].y * regB[ii & 1][cpj].z;
+                    c[(cpi * 4 + 1) * kThreadM + cpj * 4 + 3] += regA[ii & 1][cpi].y * regB[ii & 1][cpj].w;
+
+                    c[(cpi * 4 + 2) * kThreadM + cpj * 4] += regA[ii & 1][cpi].z * regB[ii & 1][cpj].x;
+                    c[(cpi * 4 + 2) * kThreadM + cpj * 4 + 1] += regA[ii & 1][cpi].z * regB[ii & 1][cpj].y;
+                    c[(cpi * 4 + 2) * kThreadM + cpj * 4 + 2] += regA[ii & 1][cpi].z * regB[ii & 1][cpj].z;
+                    c[(cpi * 4 + 2) * kThreadM + cpj * 4 + 3] += regA[ii & 1][cpi].z * regB[ii & 1][cpj].w;
+
+                    c[(cpi * 4 + 3) * kThreadM + cpj * 4] += regA[ii & 1][cpi].w * regB[ii & 1][cpj].x;
+                    c[(cpi * 4 + 3) * kThreadM + cpj * 4 + 1] += regA[ii & 1][cpi].w * regB[ii & 1][cpj].y;
+                    c[(cpi * 4 + 3) * kThreadM + cpj * 4 + 2] += regA[ii & 1][cpi].w * regB[ii & 1][cpj].z;
+                    c[(cpi * 4 + 3) * kThreadM + cpj * 4 + 3] += regA[ii & 1][cpi].w * regB[ii & 1][cpj].w;
+                }
+            }
+        }
+
+        if ((i / kBlockK) & 1)
+        {
+            subA += 2 * 1024;
+            subB += 1024;
+        }
+        else
+        {
+            subA -= 2 * 1024;
+            subB -= 1024;
+        }
+
+        subA[rowA + colA * ldSubA] = preA.x;
+        subA[rowA + (colA + 1) * ldSubA] = preA.y;
+        subA[rowA + (colA + 2) * ldSubA] = preA.z;
+        subA[rowA + (colA + 3) * ldSubA] = preA.w;
+
+        subB[(tid / 32) * kBlockN + (tid & 31)] = preB.x;
+        subB[(tid / 32) * kBlockN + (tid & 31) + 32] = preB.y;
+        subB[(tid / 32) * kBlockN + (tid & 31) + 32 * 2] = preB.z;
+        subB[(tid / 32) * kBlockN + (tid & 31) + 32 * 3] = preB.w;
+
+        __syncthreads();
+
+        regA[0][0] = *reinterpret_cast<float4 *>(&subA[rowC]);
+        regA[0][1] = *reinterpret_cast<float4 *>(&subA[rowC + 16]);
+
+        regB[0][0] = *reinterpret_cast<float4 *>(&subB[colC]);
+        regB[0][1] = *reinterpret_cast<float4 *>(&subB[colC + 32]);
+    }
+
+    // Trailing computation.
+    #pragma unroll
+    for (int ii = 0; ii < kBlockK; ++ii)
+    {
+        if (ii != 7)
+        {
+            regA[(ii + 1) & 1][0] = *reinterpret_cast<float4 *>(&subA[rowC + (ii + 1) * ldSubA]);
+            regA[(ii + 1) & 1][1] = *reinterpret_cast<float4 *>(&subA[rowC + 16 + (ii + 1) * ldSubA]);
+
+            regB[(ii + 1) & 1][0] = *reinterpret_cast<float4 *>(&subB[colC + kBlockN * (ii + 1)]);
+            regB[(ii + 1) & 1][1] = *reinterpret_cast<float4 *>(&subB[colC + 32 + kBlockN * (ii + 1)]);
+        }
+
+        #pragma unroll
+        for (int cpi = 0; cpi < kThreadM / 4; ++cpi)
+        {
+            #pragma unroll
+            for (int cpj = 0; cpj < kThreadN / 4; ++cpj)
+            {
+                c[cpi * 4 * kThreadM + cpj * 4] += regA[ii & 1][cpi].x * regB[ii & 1][cpj].x;
+                c[cpi * 4 * kThreadM + cpj * 4 + 1] += regA[ii & 1][cpi].x * regB[ii & 1][cpj].y;
+                c[cpi * 4 * kThreadM + cpj * 4 + 2] += regA[ii & 1][cpi].x * regB[ii & 1][cpj].z;
+                c[cpi * 4 * kThreadM + cpj * 4 + 3] += regA[ii & 1][cpi].x * regB[ii & 1][cpj].w;
+
+                c[(cpi * 4 + 1) * kThreadM + cpj * 4] += regA[ii & 1][cpi].y * regB[ii & 1][cpj].x;
+                c[(cpi * 4 + 1) * kThreadM + cpj * 4 + 1] += regA[ii & 1][cpi].y * regB[ii & 1][cpj].y;
+                c[(cpi * 4 + 1) * kThreadM + cpj * 4 + 2] += regA[ii & 1][cpi].y * regB[ii & 1][cpj].z;
+                c[(cpi * 4 + 1) * kThreadM + cpj * 4 + 3] += regA[ii & 1][cpi].y * regB[ii & 1][cpj].w;
+
+                c[(cpi * 4 + 2) * kThreadM + cpj * 4] += regA[ii & 1][cpi].z * regB[ii & 1][cpj].x;
+                c[(cpi * 4 + 2) * kThreadM + cpj * 4 + 1] += regA[ii & 1][cpi].z * regB[ii & 1][cpj].y;
+                c[(cpi * 4 + 2) * kThreadM + cpj * 4 + 2] += regA[ii & 1][cpi].z * regB[ii & 1][cpj].z;
+                c[(cpi * 4 + 2) * kThreadM + cpj * 4 + 3] += regA[ii & 1][cpi].z * regB[ii & 1][cpj].w;
+
+                c[(cpi * 4 + 3) * kThreadM + cpj * 4] += regA[ii & 1][cpi].w * regB[ii & 1][cpj].x;
+                c[(cpi * 4 + 3) * kThreadM + cpj * 4 + 1] += regA[ii & 1][cpi].w * regB[ii & 1][cpj].y;
+                c[(cpi * 4 + 3) * kThreadM + cpj * 4 + 2] += regA[ii & 1][cpi].w * regB[ii & 1][cpj].z;
+                c[(cpi * 4 + 3) * kThreadM + cpj * 4 + 3] += regA[ii & 1][cpi].w * regB[ii & 1][cpj].w;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        *reinterpret_cast<float4 *>(&preA) = *reinterpret_cast<float4 *>(&baseC[i * dn]);
+        preA.x = preA.x * beta + alpha * c[i * kThreadN];
+        preA.y = preA.y * beta + alpha * c[1 + i * kThreadN];
+        preA.z = preA.z * beta + alpha * c[2 + i * kThreadN];
+        preA.w = preA.w * beta + alpha * c[3 + i * kThreadN];
+        *reinterpret_cast<float4 *>(&baseC[i * dn]) = *reinterpret_cast<float4 *>(&preA);
+
+        *reinterpret_cast<float4 *>(&preA) = *reinterpret_cast<float4 *>(&baseC[i * dn + 32]);
+        preA.x = preA.x * beta + alpha * c[4 + i * kThreadN];
+        preA.y = preA.y * beta + alpha * c[5 + i * kThreadN];
+        preA.z = preA.z * beta + alpha * c[6 + i * kThreadN];
+        preA.w = preA.w * beta + alpha * c[7 + i * kThreadN];
+        *reinterpret_cast<float4 *>(&baseC[i * dn + 32]) = *reinterpret_cast<float4 *>(&preA);
+
+        *reinterpret_cast<float4 *>(&preA) = *reinterpret_cast<float4 *>(&baseC[(i + 16) * dn]);
+        preA.x = preA.x * beta + alpha * c[32 + i * kThreadN];
+        preA.y = preA.y * beta + alpha * c[33 + i * kThreadN];
+        preA.z = preA.z * beta + alpha * c[34 + i * kThreadN];
+        preA.w = preA.w * beta + alpha * c[35 + i * kThreadN];
+        *reinterpret_cast<float4 *>(&baseC[(i + 16) * dn]) = *reinterpret_cast<float4 *>(&preA);
+
+        *reinterpret_cast<float4 *>(&preA) = *reinterpret_cast<float4 *>(&baseC[(i + 16) * dn + 32]);
+        preA.x = preA.x * beta + alpha * c[36 + i * kThreadN];
+        preA.y = preA.y * beta + alpha * c[37 + i * kThreadN];
+        preA.z = preA.z * beta + alpha * c[38 + i * kThreadN];
+        preA.w = preA.w * beta + alpha * c[39 + i * kThreadN];
+        *reinterpret_cast<float4 *>(&baseC[(i + 16) * dn + 32]) = *reinterpret_cast<float4 *>(&preA);
+    }
+}
+
+
 template <typename T>
 struct Equal
 {
@@ -1065,7 +1307,8 @@ int main(int argc, char * argv[])
     constexpr bool kTestGemmSmem = true;
     constexpr bool kTestGemmSmemPadTransposedThread = true;
     constexpr bool kTestGemmSmemPadZThread = true;
-    constexpr bool kTestGemmWarpTile = true;
+    constexpr bool kTestGemmSmemWarpTile = true;
+    constexpr bool kTestGemmSmemDoubleBuffer = true;
     constexpr bool kTestCublasSGemm = true;
 
     // Problem setting.
@@ -1349,7 +1592,7 @@ int main(int argc, char * argv[])
     }
 
     // Smem with Warp Tiling
-    if constexpr (kTestGemmWarpTile)
+    if constexpr (kTestGemmSmemWarpTile)
     {
         if constexpr (1 < kDup)
         {
@@ -1389,6 +1632,60 @@ int main(int argc, char * argv[])
         CUDA_CHECK(cudaEventSynchronize(ee));
 
         std::printf("gemmSmemWarpTile: ");
+        CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
+        std::printf("took %f ms, ", ms / kDup);
+
+        if constexpr (1 == kDup)
+        {
+            checkResult(d_c, golden_c, m, n);
+        }
+        else
+        {
+            std::printf("\n");
+        }
+    }
+
+    // Double buffer.
+    if constexpr (kTestGemmSmemDoubleBuffer)
+    {
+        if constexpr (1 < kDup)
+        {
+            gemmSmemDoubleBuffer<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
+                    thrust::raw_pointer_cast(d_a.data()),
+                    thrust::raw_pointer_cast(d_b.data()),
+                    thrust::raw_pointer_cast(d_c.data()),
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        d_c = h_c;
+        CUDA_CHECK(cudaEventRecord(ss));
+
+        for (int dup = 0; dup < kDup; ++dup)
+        {
+            gemmSmemDoubleBuffer<kBlockSize, kBlockM, kBlockN, kBlockK><<<grid, block>>>(
+                    thrust::raw_pointer_cast(d_a.data()),
+                    thrust::raw_pointer_cast(d_b.data()),
+                    thrust::raw_pointer_cast(d_c.data()),
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta
+            );
+        }
+
+        CUDA_CHECK_LAST_ERROR();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaEventRecord(ee));
+        CUDA_CHECK(cudaEventSynchronize(ee));
+
+        std::printf("gemmSmemDoubleBuffer: ");
         CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
         std::printf("took %f ms, ", ms / kDup);
 
