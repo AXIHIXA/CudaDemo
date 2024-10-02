@@ -41,6 +41,26 @@ void cpuSoftmax(const float * __restrict__ in, float * __restrict__ out, int nx,
 }
 
 
+template <typename T>
+struct Max
+{
+    __device__ __forceinline__ constexpr bool operator()(const T & a, const T & b)
+    {
+        return (a < b) ? b : a;
+    }
+};
+
+
+template <typename T>
+struct Sum
+{
+    __device__ __forceinline__ bool operator()(const T & a, const T & b)
+    {
+        return a + b;
+    }
+};
+
+
 template <template <typename> class ReductionOp, typename T, int kWarpThreads = 32>
 __inline__ __device__ T warpReduce(T val)
 {
@@ -54,46 +74,142 @@ __inline__ __device__ T warpReduce(T val)
 }
 
 
-template <int kBlockDimX, int kBlockDimY, int kBlockSpanX, int kBlockSpanY, int kWarpThreads = 32>
+// Used for vectorized stores and loads.
+template <typename T, int kSize>
+struct alignas(sizeof(T) * kSize) Vec
+{
+    T val[kSize];
+};
+
+
+// Vectorized load, from src's y-th row at column x, to dst.
+template <int kPackSize>
+__device__ void vecLoad(const float * src, int y, int nx, int x, float * dst)
+{
+    using Vec = Vec<float, kPackSize>;
+    const int offset = (y * nx + x) / kPackSize;
+    *reinterpret_cast<Vec *>(dst) = *(reinterpret_cast<Vec *>(const_cast<float *>(src)) + offset);
+}
+
+
+// Vectorized store, from src, to dst's y-th row at column x.
+template <int kPackSize>
+__device__ void vecStore(const float * src, float * dst, int y, int nx, int x)
+{
+    using Vec = Vec<float, kPackSize>;
+    const int offset = (y * nx + x) / kPackSize;
+    *(reinterpret_cast<Vec *>(dst) + offset) = *reinterpret_cast<Vec *>(src);
+}
+
+
+template <int kBlockDimX, int kBlockDimY, int kBlockSpanX, int kBlockSpanY, int kPackSize, int kWarpThreads = 32>
 __global__ void softmax(const float * __restrict__ src,
                         float * __restrict__ dst,
                         int nx,
                         int ny)
 {
-    constexpr dim3 kThreadSpan(kBlockSpanX / kBlockDimX, kBlockSpanY / kBlockDimY);
+    constexpr int kThreadSpanX = kBlockSpanX / kBlockDimX;
+    constexpr int kThreadSpanY = kBlockSpanY / kBlockDimY;
+    constexpr int kNumPacks = kThreadSpanY / kPackSize;
+
+    // Each warp handles a complete line of input.
+    assert(nx <= kThreadSpanX * kWarpThreads);
+    static_assert(kBlockDimX == kWarpThreads && kWarpThreads == 32);
+
+    // Number of packs (vectorized load granularity on x dimension) should be integer.
+    static_assert(kThreadSpanX % kPackSize == 0);
 
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    const int laneIdx = tid % kWarpThreads;
-    const int warpIdx = tid / kWarpThreads;
+    const int laneIdx = threadIdx.x;
+    const int warpIdx = blockIdx.y * blockDim.y + threadIdx.y;  // Each row constitutes a warp.
+    const int globalWarps = gridDim.y * blockDim.y;  // Total number of warps in the whole grid.
+    const int yStep = globalWarps * kThreadSpanY;
 
-    const int bx = blockIdx.x * kBlockSpanX;
-    const int by = blockIdx.y * kBlockSpanY;
+    float buf[kThreadSpanY][kThreadSpanX];
 
-    float buf[kThreadSpan.y][kThreadSpan.x] = {};
-
-    float threadMax = -INFINITY;
-
-    #pragma unroll
-    for (int yi = 0; yi < kThreadSpan.y; ++yi)
+    // Region of this block.
+    for (int y = warpIdx * kThreadSpanY; y < ny; y += yStep)
     {
-        int y = by + kThreadSpan.y * yi;
+        float threadMax[kThreadSpanY];
 
-        if (y < ny)
+        // Rows by this thread.
+        for (int yy = 0; yy < kThreadSpanY; ++yy)
         {
-            #pragma unroll
-            for (int xi = 0; xi < kThreadSpan.x; ++xi)
+            threadMax[yy] = -INFINITY;
+            float * rowBuf = buf[yy];
+
+            // One row of this thread.
+            for (int packIdx = 0; packIdx < kNumPacks; ++packIdx)
             {
-                int x = bx + kThreadSpan.x * xi;
+                const int packOffset = packIdx;
+                const int x = (packIdx * kWarpThreads + laneIdx);
 
                 if (x < nx)
                 {
-                    threadMax = max(threadMax, src[y * nx + x]);
+                    vecLoad<kPackSize>(src, y + yy, nx, x, rowBuf + packOffset);
+
+                    for (int i = 0; i < kPackSize; ++i)
+                    {
+                        threadMax[yy] = max(threadMax[yy], rowBuf[packOffset + i]);
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < kPackSize; ++i)
+                    {
+                        rowBuf[packOffset + i] = -INFINITY;
+                    }
+                }
+            }
+        }
+
+        float warpMax[kThreadSpanY];
+
+
+        for (int yy = 0; yy < kThreadSpanY; ++yy)
+        {
+            warpMax[yy] = warpReduce<Max, float, kWarpThreads>(threadMax[yy]);
+        }
+
+        float threadSum[kThreadSpanY];
+
+        for (int row_id = 0; row_id < kThreadSpanY; ++row_id)
+        {
+            threadSum[row_id] = 0;
+            float * row_buf = buf[row_id];
+            // 当前线程拥有的row_buf值的总和，softmax分母的partial value
+            for (int i = 0; i < cols_per_thread; ++i)
+            {
+                row_buf[i] = Exp(row_buf[i] - warpMax[row_id]);
+                threadSum[row_id] += row_buf[i];
+            }
+        }
+        float warp_sum[kThreadSpanY];
+        // softmax分母的final value
+        for (int row_id = 0; row_id < kThreadSpanY; ++row_id)
+        {
+            warp_sum[row_id] = WarpReduce<SumOp, float, kW>(threadSum[row_id]);
+        }
+
+        for (int row_id = 0; row_id < kThreadSpanY; ++row_id)
+        {
+            float * row_buf = buf[row_id];
+            // 分子除分母得到sfotmax最终结果
+            for (int i = 0; i < cols_per_thread; ++i)
+            {
+                row_buf[i] = Div(row_buf[i], warp_sum[row_id]);
+            }
+            // 哪里来回哪里去，把最终结果写回显存
+            for (int i = 0; i < kThreadSpanX; ++i)
+            {
+                const int col = (i * kW + lane_id) * pack_size;
+                if (col < cols)
+                {
+                    vecStore<pack_size>(row_buf + i * pack_size, dst, y + row_id, cols, col);
                 }
             }
         }
     }
-
-
 }
 
 
@@ -182,6 +298,7 @@ int main(int argc, char * argv[])
     CUDA_CHECK(cudaEventCreate(&ss));
     CUDA_CHECK(cudaEventCreate(&ee));
 
+    constexpr int kPackSize = 1;
     constexpr int kWarpThreads = 32;
     constexpr dim3 kBlock(32, 8);
     constexpr int kBlockSpanX = kBlock.x * 32;
@@ -193,7 +310,7 @@ int main(int argc, char * argv[])
     {
         if constexpr (1 < kDup)
         {
-            softmax<kBlock.x, kBlock.y, kBlockSpanX, kBlockSpanY, kWarpThreads><<<grid, kBlock>>>(
+            softmax<kBlock.x, kBlock.y, kBlockSpanX, kBlockSpanY, kPackSize, kWarpThreads><<<grid, kBlock>>>(
                     thrust::raw_pointer_cast(devSrc.data()),
                     thrust::raw_pointer_cast(devDst.data()),
                     nx,
@@ -206,7 +323,7 @@ int main(int argc, char * argv[])
 
         for (int dup = 0; dup < kDup; ++dup)
         {
-            softmax<kBlock.x, kBlock.y, kBlockSpanX, kBlockSpanY, kWarpThreads><<<grid, kBlock>>>(
+            softmax<kBlock.x, kBlock.y, kBlockSpanX, kBlockSpanY, kPackSize, kWarpThreads><<<grid, kBlock>>>(
                     thrust::raw_pointer_cast(devSrc.data()),
                     thrust::raw_pointer_cast(devDst.data()),
                     nx,
