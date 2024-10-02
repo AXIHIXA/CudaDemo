@@ -23,7 +23,8 @@ More details are available in `src/utils/`.
   - FP32 and FP16 versions
   - For FP16: Vectorized FP16 arithmetics (`__hadd2`, etc.)
 - Softmax
-  - ?
+  - Implemented at warp's perspective (Registers directly, no SMEM).
+  - Vectorized loads and stores as optmization. 
 - Matrix Transpose
   - Naive GMEM
   - Padded SMEM Version with no bank conflicts
