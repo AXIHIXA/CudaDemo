@@ -152,7 +152,6 @@ __global__ void softmax(const float * __restrict__ src,
                 const int packOffset = packIdx * kPackSize;
                 const int x = (packIdx * kWarpThreads + laneIdx) * kPackSize;
 
-
                 if (x < nx)
                 {
                     vecLoad<kPackSize>(src, baseY + rowIdx, nx, x, rowBuf + packOffset);
