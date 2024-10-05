@@ -83,23 +83,11 @@ struct alignas(sizeof(T) * kSize) Vec
 };
 
 
-// Vectorized load, from src's y-th row at column x, to dst.
 template <int kPackSize>
-__device__ void vecLoad(const float * src, int y, int nx, int x, float * dst)
+__device__ void vecLoadStore(const float * src, float * dst)
 {
     using Vec = Vec<float, kPackSize>;
-    const int offset = (y * nx + x) / kPackSize;
-    *reinterpret_cast<Vec *>(dst) = *(reinterpret_cast<const Vec *>(src) + offset);
-}
-
-
-// Vectorized store, from src, to dst's y-th row at column x.
-template <int kPackSize>
-__device__ void vecStore(const float * src, float * dst, int y, int nx, int x)
-{
-    using Vec = Vec<float, kPackSize>;
-    const int offset = (y * nx + x) / kPackSize;
-    *(reinterpret_cast<Vec *>(dst) + offset) = *reinterpret_cast<const Vec *>(src);
+    *reinterpret_cast<Vec *>(dst) = *(reinterpret_cast<const Vec *>(src));
 }
 
 
@@ -123,49 +111,54 @@ __global__ void softmax(const float * __restrict__ src,
     static_assert(kThreadSpanX % kPackSize == 0);
 
     const int tid = threadIdx.y * kBlockDimX + threadIdx.x;
-    const int laneIdx = threadIdx.x;
-    const int globalWarpIdx = blockIdx.y * blockDim.y + threadIdx.y;  // Each row constitutes a warp.
-    const int globalWarps = gridDim.y * blockDim.y;  // Total number of warps in the whole grid.
-    const int yStep = globalWarps * kThreadSpanY;
+    const int globalWarpIdx = blockIdx.y * blockDim.y + threadIdx.y;
+    const int numGlobalWarps = gridDim.y * blockDim.y;
+    const int laneIdx = tid % kWarpThreads;
 
     float buf[kThreadSpanY][kThreadSpanX];
 
-    // Warp view.
-    for (int baseY = globalWarpIdx * kThreadSpanY; baseY < ny; baseY += yStep)
+    // Grid translation.
+    for (int baseY = globalWarpIdx * kThreadSpanY; baseY < ny; baseY += numGlobalWarps * kThreadSpanY)
     {
         float threadMax[kThreadSpanY];
 
-        // Warp view, each thread processes a row at a time.
-        // Each thread reads part of a row into register and perform max reduciton.
+        // Rows handled by a warp.
+        #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
-            // Current row: baseY + rowIdx (same row for all threads in a warp).
-            threadMax[rowIdx] = kMinusInfinity;
-            float * rowBuf = buf[rowIdx];
+            const int gy = baseY + rowIdx;
 
-            // Each threads loads kThreadSpanX elements into its rowBuf (GMEM -> REG),
-            // loads are done by kNumPacks vectorized loads, each pack of length kPackSize.
-            // Note that different packs of a thread are STRIDED
-            // (to preserve a coalesced GMEM access footprint at warp scale).
-            for (int packIdx = 0; packIdx < kNumPacks; ++packIdx)
+            if (gy < ny)
             {
-                const int packOffset = packIdx * kPackSize;
-                const int x = (packIdx * kWarpThreads + laneIdx) * kPackSize;
+                float * rowBuf = buf[rowIdx];
+                threadMax[rowIdx] = kMinusInfinity;
 
-                if (x < nx)
+                // Vectorized load packs in this warp (row), by this thread.
+                // Each threads loads kThreadSpanX elements into its rowBuf (GMEM -> REG).
+                // Loads are done by kNumPacks vectorized packs, each pack of length kPackSize.
+                // Packs by the same threads are strided, so that warp GMEM loads are coalesced.
+                #pragma unroll
+                for (int packIdx = 0; packIdx < kNumPacks; ++packIdx)
                 {
-                    vecLoad<kPackSize>(src, baseY + rowIdx, nx, x, rowBuf + packOffset);
+                    const int gx = packIdx * kPackSize * kWarpThreads + laneIdx * kPackSize;
+                    const int packOffset = packIdx * kPackSize;
 
-                    for (int i = 0; i < kPackSize; ++i)
+                    if (gx < nx)
                     {
-                        threadMax[rowIdx] = max(threadMax[rowIdx], rowBuf[packOffset + i]);
+                        vecLoadStore<kPackSize>(src + gy * nx + gx, rowBuf + packOffset);
+
+                        for (int pi = 0; pi < kPackSize; ++pi)
+                        {
+                            threadMax[rowIdx] = max(threadMax[rowIdx], rowBuf[packOffset + pi]);
+                        }
                     }
-                }
-                else
-                {
-                    for (int i = 0; i < kPackSize; ++i)
+                    else
                     {
-                        rowBuf[packOffset + i] = kMinusInfinity;
+                        #pragma unroll
+                        for (int pi = 0; pi < kPackSize; ++pi)
+                        {
+                            rowBuf[packOffset + pi] = kMinusInfinity;
+                        }
                     }
                 }
             }
@@ -174,50 +167,66 @@ __global__ void softmax(const float * __restrict__ src,
         // Warp max aka row max.
         float rowMax[kThreadSpanY];
 
+        #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
             rowMax[rowIdx] = warpReduce<Max, float>(threadMax[rowIdx]);
         }
 
+        // Thread sum and in-place exp.
         // Thread sum needs to be calculated after row max is reduced.
         // Modify in-place of registers from xi to exp(xi - xMax).
         float threadSum[kThreadSpanY];
 
+        #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
-            threadSum[rowIdx] = 0;
             float * rowBuf = buf[rowIdx];
+            threadSum[rowIdx] = 0;
 
-            for (int i = 0; i < kThreadSpanX; ++i)
+            #pragma unroll
+            for (int xi = 0; xi < kThreadSpanX; ++xi)
             {
-                rowBuf[i] = exp(rowBuf[i] - rowMax[rowIdx]);
-                threadSum[rowIdx] += rowBuf[i];
+                rowBuf[xi] = exp(rowBuf[xi] - rowMax[rowIdx]);
+                threadSum[rowIdx] += rowBuf[xi];
             }
         }
 
+        // Row sum aka warp sum.
         float rowSum[kThreadSpanY];
 
+        #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
             rowSum[rowIdx] = warpReduce<Sum, float>(threadSum[rowIdx]);
         }
 
+        // Softmax division and writeback.
+        #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
-            float * rowBuf = buf[rowIdx];
+            const int gy = baseY + rowIdx;
 
-            for (int i = 0; i < kThreadSpanX; ++i)
+            if (gy < ny)
             {
-                rowBuf[i] = rowBuf[i] / rowSum[rowIdx];
-            }
+                float * rowBuf = buf[rowIdx];
 
-            for (int i = 0; i < kThreadSpanX; ++i)
-            {
-                const int x = (i * kWarpThreads + laneIdx) * kPackSize;
-
-                if (x < nx)
+                #pragma unroll
+                for (int xi = 0; xi < kThreadSpanX; ++xi)
                 {
-                    vecStore<kPackSize>(rowBuf + i * kPackSize, dst, baseY + rowIdx, nx, x);
+                    rowBuf[xi] /= rowSum[rowIdx];
+                }
+
+                #pragma unroll
+                for (int packIdx = 0; packIdx < kNumPacks; ++packIdx)
+                {
+                    const int gx = packIdx * kPackSize * kWarpThreads + laneIdx * kPackSize;
+                    const int packOffset = packIdx * kPackSize;
+
+                    if (gx < nx)
+                    {
+                        vecLoadStore<kPackSize>(rowBuf + packOffset, dst + gy * nx + gx);
+                    }
                 }
             }
         }
