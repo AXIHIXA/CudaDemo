@@ -349,7 +349,7 @@ int main(int argc, char * argv[])
     CUDA_CHECK(cudaEventCreate(&ss));
     CUDA_CHECK(cudaEventCreate(&ee));
 
-    constexpr int kPackSize = 1;
+    constexpr int kPackSize = 4;
     constexpr int kWarpThreads = 32;
     constexpr dim3 kBlock(32, 8);
     constexpr int kBlockSpanX = kBlock.x * 32;
