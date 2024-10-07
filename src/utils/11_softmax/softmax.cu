@@ -84,7 +84,7 @@ struct alignas(sizeof(T) * kSize) Vec
 
 
 template <int kPackSize>
-__device__ void vecLoadStore(const float * src, float * dst)
+__device__ void vecLdSt(const float * src, float * dst)
 {
     using Vec = Vec<float, kPackSize>;
     *reinterpret_cast<Vec *>(dst) = *(reinterpret_cast<const Vec *>(src));
@@ -145,8 +145,9 @@ __global__ void softmax(const float * __restrict__ src,
 
                     if (gx < nx)
                     {
-                        vecLoadStore<kPackSize>(src + gy * nx + gx, rowBuf + packOffset);
+                        vecLdSt<kPackSize>(src + gy * nx + gx, rowBuf + packOffset);
 
+                        #pragma unroll
                         for (int pi = 0; pi < kPackSize; ++pi)
                         {
                             threadMax[rowIdx] = max(threadMax[rowIdx], rowBuf[packOffset + pi]);
@@ -225,7 +226,7 @@ __global__ void softmax(const float * __restrict__ src,
 
                     if (gx < nx)
                     {
-                        vecLoadStore<kPackSize>(rowBuf + packOffset, dst + gy * nx + gx);
+                        vecLdSt<kPackSize>(rowBuf + packOffset, dst + gy * nx + gx);
                     }
                 }
             }
@@ -278,6 +279,11 @@ void checkResult(const float * __restrict__ res,
 
     if constexpr (kDebugOutput)
     {
+        if (correct)
+        {
+            return;
+        }
+
         printf("res:\n");
 
         for (int y = 0; y < 2; ++y)

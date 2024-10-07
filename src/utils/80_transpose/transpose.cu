@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
+#include <thrust/execution_policy.h>
 #include <thrust/host_vector.h>
 
 #include "utils/cuda_utils.h"
@@ -38,39 +39,42 @@ __global__ void transposeNaive(const T * __restrict__ in, int nx, int ny, T * __
 /// margin (remainder) elements will be read by in-bound threads
 /// (with these in-bound threads write NOTHING)
 /// but written by out-of-bound threads!
-template <int kPadding = 1, typename T>
-__global__ void transpose(const T * __restrict__ in, int nx, int ny, T * __restrict__ out)
+template <int kBlockDimX, int kBlockDimY, int kPadding = 1, typename T>
+__global__ void transpose(const T * __restrict__ src, int nx, int ny, T * __restrict__ dst)
 {
-    extern __shared__ T smem[];  // smem[blockDim.y][blockDim.x + kPadding].
+    // SMEM of shape (kBlockDimY, kLdS).
+    extern __shared__ T smem[];
+    constexpr int kLdS = kBlockDimX + kPadding;
 
-    int ix = blockIdx.x * blockDim.x + threadIdx.x;
-    int iy = blockIdx.y * blockDim.y + threadIdx.y;
-    int from = iy * nx + ix;
-    int s = threadIdx.y * (blockDim.x + kPadding) + threadIdx.x;
+    int gx = blockIdx.x * kBlockDimX + threadIdx.x;
+    int gy = blockIdx.y * kBlockDimY + threadIdx.y;
+    int gi = gy * nx + gx;
+    int si = threadIdx.y * kLdS + threadIdx.x;
 
-    if (ix < nx && iy < ny)
+    if (gx < nx && gy < ny)
     {
-        smem[s] = in[from];
+        smem[si] = src[gi];
     }
 
     __syncthreads();
 
     // This thread will write t-th (column major) element in smem.
     // What's its x, y coordinates in this block?
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int sx = tid / blockDim.y;
-    int sy = tid % blockDim.y;
-    s = sy * (blockDim.x + kPadding) + sx;
+    const int tid = threadIdx.y * kBlockDimX + threadIdx.x;
+    const int sx = tid / kBlockDimY;
+    const int sy = tid % kBlockDimY;
+    si = sy * kLdS + sx;
 
-    ix = blockIdx.y * blockDim.y + sy;
-    iy = blockIdx.x * blockDim.x + sx;
-    int to = iy * ny + ix;
+    gx = blockIdx.y * kBlockDimY + sy;
+    gy = blockIdx.x * kBlockDimX + sx;
+    gi = gy * ny + gx;
 
-    if (ix < ny && iy < nx)
+    if (gx < ny && gy < nx)
     {
-        out[to] = smem[s];
+        dst[gi] = smem[si];
     }
 }
+
 
 
 void print(const thrust::host_vector<float> & in, int r, int c, const thrust::host_vector<float> & out)
@@ -180,7 +184,7 @@ int main(int argc, char * argv[])
 
     // Regular
     #ifdef NDEBUG
-    transpose<kPadding><<<grid, block, (block.x + kPadding) * block.y * sizeof(float)>>>(
+    transpose<block.x, block.y, kPadding><<<grid, block, (block.x + kPadding) * block.y * sizeof(float)>>>(
         d_in.data().get(), c, r, d_out.data().get());
     CUDA_CHECK_LAST_ERROR();
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -191,7 +195,7 @@ int main(int argc, char * argv[])
 
     for (int dup = 0; dup < kDup; ++dup)
     {
-        transpose<kPadding><<<grid, block, (block.x + kPadding) * block.y * sizeof(float)>>>(
+        transpose<block.x, block.y, kPadding><<<grid, block, (block.x + kPadding) * block.y * sizeof(float)>>>(
             d_in.data().get(), c, r, d_out.data().get());
     }
 

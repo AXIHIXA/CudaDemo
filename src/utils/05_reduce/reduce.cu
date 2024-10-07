@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
+#include <thrust/execution_policy.h>
 #include <thrust/host_vector.h>
 
 #include "utils/cuda_utils.h"
@@ -269,42 +270,93 @@ __global__ void reduceFullUnroll(const T * __restrict__ in, T * __restrict__ out
 // Use grid translation (adapt to input size) instead of block translation (of compile-time constant steps).
 // Adapts to input size automatically, at a cost of degraded performance.
 // Trade-off.
-template <unsigned kBlockSize, typename T>
-__global__ void reduceGridTranslationFullUnroll(const T * __restrict__ in, int nx, T * __restrict__ out)
+template <int kBlockDimX, typename T>
+__global__ void reduceGridTranslationFullUnroll(const T * __restrict__ src, int nx, T * __restrict__ dst)
 {
-    __shared__ T smem[kBlockSize];
+    constexpr int kWarpThreads = 32;
+    static_assert((kBlockDimX & (kBlockDimX - 1)) == 0 && kBlockDimX % kWarpThreads == 0);
 
-    const unsigned gridSize = gridDim.x;
-    unsigned from = blockIdx.x * kBlockSize + threadIdx.x;
-    unsigned tid = threadIdx.x;
+    __shared__ T smem[kBlockDimX];
+
+    const int tid = threadIdx.x;
+    const int baseX = blockIdx.x * kBlockDimX + threadIdx.x;
+    const int gridStride = gridDim.x * kBlockDimX;
 
     smem[tid] = 0;
 
-    for (; from < nx; from += gridSize * kBlockSize)
+    for (int gx = baseX; gx < nx; gx += gridStride)
     {
-        smem[tid] += in[from];
+        smem[tid] += src[gx];
     }
 
     __syncthreads();
 
-    blockSmemReduce<kBlockSize>(smem);
+    #pragma unroll
+    for (int step = (kBlockDimX >> 1); kWarpThreads < step; step >>= 1)
+    {
+        if (tid < step)
+        {
+            smem[tid] += smem[tid + step];
+        }
+
+        __syncthreads();
+    }
+
+    if (tid < kWarpThreads)
+    {
+        volatile T * vshm = smem;
+        T x = vshm[tid];
+
+        if (64 <= kBlockDimX)
+        {
+            x += vshm[tid + 32]; __syncwarp();
+            vshm[tid] = x; __syncwarp();
+        }
+
+        x += vshm[tid + 16]; __syncwarp();
+        vshm[tid] = x; __syncwarp();
+        x += vshm[tid + 8]; __syncwarp();
+        vshm[tid] = x; __syncwarp();
+        x += vshm[tid + 4]; __syncwarp();
+        vshm[tid] = x; __syncwarp();
+        x += vshm[tid + 2]; __syncwarp();
+        vshm[tid] = x; __syncwarp();
+        x += vshm[tid + 1]; __syncwarp();
+        vshm[tid] = x; __syncwarp();
+    }
 
     if (tid == 0)
     {
-        out[blockIdx.x] = smem[0];
+        dst[blockIdx.x] = smem[0];
     }
 }
 
 
 template <typename T>
-__device__ T warpShuffleReduce(T sum)
+__device__ T warpReduce(T val)
 {
-    sum += __shfl_down_sync(0xffffffff, sum, 16);
-    sum += __shfl_down_sync(0xffffffff, sum, 8);
-    sum += __shfl_down_sync(0xffffffff, sum, 4);
-    sum += __shfl_down_sync(0xffffffff, sum, 2);
-    sum += __shfl_down_sync(0xffffffff, sum, 1);
-    return sum;
+    constexpr unsigned mask = 0xffffffff;
+    constexpr int kWarpThreads = 32;
+
+    #if false
+    // Does not populate warp reduction result to all threads.
+    // Sub-optimal to the butterfly variant below.
+    val += __shfl_down_sync(0xffffffff, val, 16);
+    val += __shfl_down_sync(0xffffffff, val, 8);
+    val += __shfl_down_sync(0xffffffff, val, 4);
+    val += __shfl_down_sync(0xffffffff, val, 2);
+    val += __shfl_down_sync(0xffffffff, val, 1);
+    return val;
+    #endif  // false
+
+    // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#reduction-across-a-warp
+    #pragma unroll
+    for (int laneMask = (kWarpThreads >> 1); 0 < laneMask; laneMask >>= 1)
+    {
+        val += __shfl_xor_sync(mask, val, laneMask, kWarpThreads);
+    }
+
+    return val;
 }
 
 
@@ -329,7 +381,7 @@ __global__ void reduceGridTranslationWarpShuffle(const T * __restrict__ in, int 
     const int laneIdx = tid % kWarpSize;
     const int warpIdx = tid / kWarpSize;
 
-    sum = warpShuffleReduce(sum);
+    sum = warpReduce(sum);
 
     if (laneIdx == 0)
     {
@@ -345,7 +397,7 @@ __global__ void reduceGridTranslationWarpShuffle(const T * __restrict__ in, int 
     // Thus a second warpShuffleReduce will sum the 8 warpSums in this block.
     if (warpIdx == 0)
     {
-        sum = warpShuffleReduce(sum);
+        sum = warpReduce(sum);
     }
 
     if (tid == 0)
@@ -365,7 +417,7 @@ void checkResult(const thrust::device_vector<float> & in, const thrust::host_vec
 
 int main(int argc, char * argv[])
 {
-    constexpr int n = 25'600;
+    constexpr int n = 25'600'000;
     thrust::host_vector<float> h_in(n, 1.0f);
     thrust::device_vector<float> d_in = h_in;
     thrust::device_vector<float> d_out(n, 0.0f);

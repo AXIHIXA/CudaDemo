@@ -32,10 +32,10 @@ __global__ void fp32Flops(const float * __restrict__ x,
     int startClock = 0;
     asm volatile("mov.u32 %0, %%clock;" : "=r"(startClock)::"memory");
 
-    // Q1: Why use 4 fma instruction to get GPU peak performance?
-    // A1: We use >2 (3 or 4) fma instruction to hide for loop comparsion and addition instruction overhead.
-    // Q2: Why use 4 dependant fma instruction to get GPU peak performance, can we use 4 independant ones?
-    // A2: Yes, we can use 2/3/4 independant ones.
+    // Q1: Why use 4 fma instructions to get GPU peak performance?
+    // A1: We use 2+ fma instructions to hide for loop comparsion and addition instruction overhead.
+    // Q2: Why use 4 dependant fma instructions to get GPU peak performance, can we use 4 independant ones?
+    // A2: Yes.
     for (int i = 0; i < kDups; ++i)
     {
         asm volatile(
