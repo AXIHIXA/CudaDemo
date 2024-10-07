@@ -25,8 +25,10 @@ More details are available in `src/utils/`.
 - Softmax
   - Implemented at warp's perspective (Registers directly, no SMEM).
   - Vectorized loads and stores as optmization. 
-- Measure Peak FP32 LOPS
-  - Evaluated by FP32 FMAs while saturating all available SMs. 
+- Measure Peak Performance
+  - Evaluates GMEM bandwidth by vectorized loads. 
+    - GMEM bandwidth is evaluated by oversized loads (so that L2 cache gets flushed.)
+  - Evaluates peak computing performance by FP32 FMAs while saturating all available SMs. 
 - Matrix Transpose
   - Naive GMEM
   - Padded SMEM Version with no bank conflicts
