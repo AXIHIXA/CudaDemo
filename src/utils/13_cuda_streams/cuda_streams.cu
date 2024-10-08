@@ -47,15 +47,15 @@ int main(int argc, char * argv[])
     T * hy;
     T * hz;
 
-    // MUST manually alllocate pinned memory using cudaMallocHost
+    // MUST manually alllocate pinned memory using cudaHostAlloc
     CUDA_CHECK(cudaHostAlloc(&hx, numBytes, cudaHostAllocDefault));
     CUDA_CHECK(cudaHostAlloc(&hy, numBytes, cudaHostAllocDefault));
     CUDA_CHECK(cudaHostAlloc(&hz, numBytes, cudaHostAllocDefault));
 
     for (int i = 0; i < arraySize; ++i)
     {
-        hx[i] = 1.0;
-        hy[i] = 1.0;
+        hx[i] = 1.0f;
+        hy[i] = 1.0f;
     }
 
     auto hz_cpu = reinterpret_cast<T *>(malloc(numBytes));
