@@ -32,6 +32,7 @@ More details are available in `src/utils/`.
 - CUDA Streams
   - Experiments with cudaMemcpyAsync and non-default-stream kernel launches. 
     - Must use pinned host memory. 
+    - Overlaps kernel execution with host-device memory transfer. 
   - Observed performance boost with non-default streams. 
 - Matrix Transpose
   - Naive GMEM
