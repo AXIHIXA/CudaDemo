@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
+#include <thrust/equal.h>
 #include <thrust/execution_policy.h>
 #include <thrust/host_vector.h>
 
@@ -90,49 +92,77 @@ __device__ acc_t blockReduce(acc_t val)
 }
 
 
+/// alpha * A @ X + beta * Y.
 /// Each 1D block computes one element in output.
-template <
-        int kBlockDimX, int kBlockDimY,
-        int kBlockSpanX, int kBlockSpanY,
-        int kPadding = 4,
-        typename in_t, typename acc_t>
+template <int kBlockDimX, int kBlockDimY>
 __global__ void gemvNaive(
-        const in_t * __restrict__ a,
-        const in_t * __restrict__ x,
-        acc_t * __restrict__ y,
+        const float * __restrict__ a,
+        const float * __restrict__ x,
+        float * __restrict__ y,
         int dm,
         int dn,
-        acc_t alpha,
-        acc_t beta)
+        float alpha,
+        float beta)
 {
-    static_assert(std::is_same_v<in_t, float>);
-    static_assert(kBlockSpanX % kBlockDimX == 0);
-    static_assert(kBlockDimY == 1 && kBlockSpanY == 1);
-    constexpr int kThreadSpanX = kBlockSpanX / kBlockDimX;
-    constexpr int kPackSize = 1;
+    // Alignment requirements for float4 vectorized loads/stores.
+    // Note that this works only for Debug builds...
+    assert(dm % 4 == 0);
 
-    acc_t threadData;
+    static_assert(kBlockDimY == 1);
+    constexpr int kPackSize = 4;
+    constexpr int kBlockSpanX = kPackSize * kBlockDimX;
 
-    // Grid Translation.
-    for (int gy = blockIdx.y * kBlockSpanY; gy < dm; gy += gridDim.x * kBlockSpanY)
+    float4 threadData;
+
+    // Grid Translation to cover all rows.
+    for (int gy = blockIdx.y; gy < dm; gy += gridDim.x)
     {
-        threadData = 0;
+        threadData.x = 0;
+        threadData.y = 0;
+        threadData.z = 0;
+        threadData.w = 0;
 
-        #pragma unroll
-        for (int packIdx = 0; packIdx < kThreadSpanX; ++packIdx)
+        // Block Translation to cover all columns.
+        for (int baseX = 0; baseX < dn; baseX += kBlockSpanX)
         {
-            // p0 p0 p0 ... p0   p1 p1 p1 ... p1   ...
-            const int gx = packIdx * kPackSize * kBlockDimX + threadIdx.x * kPackSize;
+            const int gx = baseX + threadIdx.x * kPackSize;
 
             if (gx < dn)
             {
-                threadData += a[gy * dn + gx] * x[gx];
+                float4 a4 = *reinterpret_cast<const float4 *>(a + gy * dn + gx);
+                float4 x4 = *reinterpret_cast<const float4 *>(x + gx);
+                threadData.x += a4.x * x4.x;
+                threadData.y += a4.y * x4.y;
+                threadData.z += a4.z * x4.z;
+                threadData.w += a4.w * x4.w;
             }
         }
 
+        threadData.x = blockReduce<kBlockDimX, kBlockDimY>(threadData.x);
+        threadData.y = blockReduce<kBlockDimX, kBlockDimY>(threadData.y);
+        threadData.z = blockReduce<kBlockDimX, kBlockDimY>(threadData.z);
+        threadData.w = blockReduce<kBlockDimX, kBlockDimY>(threadData.w);
 
+        if (threadIdx.x == 0)
+        {
+            y[gy] = alpha * (threadData.x + threadData.y + threadData.z + threadData.w) + beta * y[gy];
+        }
     }
+}
 
+
+/// alpha * A @ X + beta * Y.
+/// Each 1D block computes one element in output.
+template <int kBlockDimX, int kBlockDimY, int kBlockSpanX, int kBlockSpanY>
+__global__ void gemvSmem(
+        const float * __restrict__ a,
+        const float * __restrict__ x,
+        float * __restrict__ y,
+        int dm,
+        int dn,
+        float alpha,
+        float beta)
+{
 
 }
 
@@ -164,30 +194,62 @@ void checkResult(const thrust::device_vector<acc_t> & result,
                  const thrust::device_vector<acc_t> & golden,
                  int dm)
 {
+    bool resultIsCorrect = thrust::equal(thrust::device, result.cbegin(), result.cend(), golden.cbegin(), Equal<acc_t>());
+
     if constexpr (kDebugOutput)
     {
-        thrust::host_vector<acc_t> a = result;
-        thrust::host_vector<acc_t> b = golden;
-
-        printf("Result:\n");
-        for (int i = 0; i < dm; ++i)
+        if (!resultIsCorrect)
         {
-            printf("%f ", a[i]);
-            printf("\n");
-        }
-        printf("\n\n");
+            thrust::host_vector<acc_t> a = result;
+            thrust::host_vector<acc_t> b = golden;
 
-        printf("Ground truth:\n");
-        for (int i = 0; i < dm; ++i)
-        {
-            printf("%f ", b[i]);
-            printf("\n");
+            printf("Result:\n");
+            for (int i = 0; i < dm; ++i)
+            {
+                printf("%f ", a[i]);
+                printf("\n");
+            }
+            printf("\n\n");
+
+            printf("Ground truth:\n");
+            for (int i = 0; i < dm; ++i)
+            {
+                printf("%f ", b[i]);
+                printf("\n");
+            }
+            printf("\n\n");
         }
-        printf("\n\n");
     }
 
-    bool resultIsCorrect = thrust::equal(thrust::device, result.cbegin(), result.cend(), golden.cbegin(), Equal<acc_t>());
     std::printf("Result is %s\n\n", resultIsCorrect ? "correct." : "WRONG!!!");
+}
+
+
+void displayInputs(const thrust::host_vector<float> & h_a,
+                   const thrust::host_vector<float> & h_x,
+                   int m,
+                   int n,
+                   float alpha,
+                   float beta)
+{
+    printf("alpha = %f, beta = %f\n", alpha, beta);
+
+    printf("A:\n");
+    for (int y = 0; y < m; ++y)
+    {
+        for (int x = 0; x < n; ++x)
+        {
+            printf("%6.0f ", h_a[y * n + x]);
+        }
+        printf("\n");
+    }
+
+    printf("X:\n");
+    for (int y = 0; y < m; ++y)
+    {
+        printf("%6.0f ", h_x[y]);
+    }
+    printf("\n");
 }
 
 
@@ -203,17 +265,13 @@ int main(int argc, char * argv[])
     ///                    Enable when checking correctness or profiling.
     ///                    Disable when debugging output.
     constexpr int kDup = 1;
-    constexpr bool kRandInput = false;
+    constexpr bool kRandInput = true;
 
     constexpr bool kTestGemvNaive = true;
     constexpr bool kTestGemvSmem = true;
 
     // Problem setting.
-    // Tested on NVIDIA Geforce RTX 2080 Ti (kDup=100, kRandInput=true),
-    // gemmSmemPad reaches 80% cublasSgemm performance on m=n=k=2048,
-    //                     90% cublasSgemm performance on m=n=k=4096.
-    // It shows that CUBLAS_DEFAULT_MATH defaults to CUBLAS_TF32_TENSOR_OP_MATH.
-    int problemSize = 4;
+    int problemSize = 1024;
     int m = problemSize;
     int n = problemSize;
     float alpha = 1.0f;
@@ -227,14 +285,19 @@ int main(int argc, char * argv[])
     if constexpr (kRandInput)
     {
         unsigned seed = std::random_device()();
+        // std::printf("seed = %u\n", seed);
         std::default_random_engine e(seed);
         // std::normal_distribution<float> d(0.0f, 1.0f);
         std::uniform_int_distribution d(1, 20);
         auto g = [&e, &d]() -> float { return d(e); };
+        alpha = g();
+        beta = g();
         std::generate(h_a.begin(), h_a.end(), g);
         std::generate(h_x.begin(), h_x.end(), g);
         std::generate(h_y.begin(), h_y.end(), g);
     }
+
+    // displayInputs(h_a, h_x, m, n, alpha, beta);
 
     thrust::device_vector<float> golden_y(n);
     thrust::device_vector<float> d_a = h_a;
@@ -267,15 +330,14 @@ int main(int argc, char * argv[])
 
     constexpr int kBlockDimX = 128;
     constexpr int kBlockDimY = 1;
-    constexpr int kBlockSpanX = 128;
-    constexpr int kBlockSpanY = 1;
     constexpr dim3 kBlock(kBlockDimX, kBlockDimY);
     dim3 grid(std::min(1, m >> 1));
 
     // GEMV Naive.
     if (kTestGemvNaive)
     {
-        gemvNaive<128, 1, kBlockSpanX, kBlockSpanY><<<grid, kBlock>>>(
+        d_y = h_y;
+        gemvNaive<kBlockDimX, kBlockDimY><<<grid, kBlock>>>(
                thrust::raw_pointer_cast(d_a.data()),
                thrust::raw_pointer_cast(d_x.data()),
                thrust::raw_pointer_cast(d_y.data()),

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -93,56 +94,76 @@ __device__ acc_t blockReduce(acc_t val)
 
 /// alpha * A @ X + beta * Y.
 /// Each 1D block computes one element in output.
-template <
-        int kBlockDimX, int kBlockDimY,
-        int kBlockSpanX, int kBlockSpanY,
-        int kPadding = 4,
-        typename in_t, typename acc_t>
+template <int kBlockDimX, int kBlockDimY>
 __global__ void gemvNaive(
-        const in_t * __restrict__ a,
-        const in_t * __restrict__ x,
-        acc_t * __restrict__ y,
+        const float * __restrict__ a,
+        const float * __restrict__ x,
+        float * __restrict__ y,
         int dm,
         int dn,
-        acc_t alpha,
-        acc_t beta)
+        float alpha,
+        float beta)
 {
-    static_assert(std::is_same_v<in_t, float>);
-    static_assert(kBlockSpanX % kBlockDimX == 0);
-    static_assert(kBlockDimY == 1 && kBlockSpanY == 1);
-    constexpr int kThreadSpanX = kBlockSpanX / kBlockDimX;
-    constexpr int kPackSize = 1;
+    // Alignment requirements for float4 vectorized loads/stores.
+    // Note that this works only for Debug builds...
+    assert(dm % 4 == 0);
 
-    acc_t threadData;
+    static_assert(kBlockDimY == 1);
+    constexpr int kPackSize = 4;
+    constexpr int kBlockSpanX = kPackSize * kBlockDimX;
+
+    float4 threadData;
 
     // Grid Translation to cover all rows.
-    for (int gy = blockIdx.y * kBlockSpanY; gy < dm; gy += gridDim.x * kBlockSpanY)
+    for (int gy = blockIdx.y; gy < dm; gy += gridDim.x)
     {
-        threadData = 0;
+        threadData.x = 0;
+        threadData.y = 0;
+        threadData.z = 0;
+        threadData.w = 0;
 
         // Block Translation to cover all columns.
         for (int baseX = 0; baseX < dn; baseX += kBlockSpanX)
         {
-            #pragma unroll
-            for (int packIdx = 0; packIdx < kThreadSpanX; ++packIdx)
-            {
-                // p0 p0 p0 ... p0   p1 p1 p1 ... p1   ...
-                const int gx = baseX + packIdx * kPackSize * kBlockDimX + threadIdx.x * kPackSize;
+            const int gx = baseX + threadIdx.x * kPackSize;
 
-                if (gx < dn)
-                {
-                    threadData += a[gy * dn + gx] * x[gx];
-                }
+            if (gx < dn)
+            {
+                float4 a4 = *reinterpret_cast<const float4 *>(a + gy * dn + gx);
+                float4 x4 = *reinterpret_cast<const float4 *>(x + gx);
+                threadData.x += a4.x * x4.x;
+                threadData.y += a4.y * x4.y;
+                threadData.z += a4.z * x4.z;
+                threadData.w += a4.w * x4.w;
             }
         }
 
-        threadData = blockReduce<kBlockDimX, kBlockDimY>(threadData);
+        threadData.x = blockReduce<kBlockDimX, kBlockDimY>(threadData.x);
+        threadData.y = blockReduce<kBlockDimX, kBlockDimY>(threadData.y);
+        threadData.z = blockReduce<kBlockDimX, kBlockDimY>(threadData.z);
+        threadData.w = blockReduce<kBlockDimX, kBlockDimY>(threadData.w);
 
         if (threadIdx.x == 0)
         {
-            y[gy] = alpha * threadData + beta * y[gy];
+            y[gy] = alpha * (threadData.x + threadData.y + threadData.z + threadData.w) + beta * y[gy];
         }
     }
+}
+
+
+/// alpha * A @ X + beta * Y.
+/// Each 1D block computes one element in output.
+template <int kBlockDimX, int kBlockDimY, int kBlockSpanX, int kBlockSpanY>
+__global__ void gemvSmem(
+        const float * __restrict__ a,
+        const float * __restrict__ x,
+        float * __restrict__ y,
+        int dm,
+        int dn,
+        float alpha,
+        float beta)
+{
+
 }
 
 
@@ -309,8 +330,6 @@ int main(int argc, char * argv[])
 
     constexpr int kBlockDimX = 128;
     constexpr int kBlockDimY = 1;
-    constexpr int kBlockSpanX = 128;
-    constexpr int kBlockSpanY = 1;
     constexpr dim3 kBlock(kBlockDimX, kBlockDimY);
     dim3 grid(std::min(1, m >> 1));
 
@@ -318,7 +337,7 @@ int main(int argc, char * argv[])
     if (kTestGemvNaive)
     {
         d_y = h_y;
-        gemvNaive<kBlockDimX, kBlockDimY, kBlockSpanX, kBlockSpanY><<<grid, kBlock>>>(
+        gemvNaive<kBlockDimX, kBlockDimY><<<grid, kBlock>>>(
                thrust::raw_pointer_cast(d_a.data()),
                thrust::raw_pointer_cast(d_x.data()),
                thrust::raw_pointer_cast(d_y.data()),

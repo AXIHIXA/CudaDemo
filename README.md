@@ -33,13 +33,11 @@ More details are available in `src/utils/`.
   - Experiments with cudaMemcpyAsync and non-default-stream kernel launches. 
     - Must use pinned host memory. 
     - Overlaps kernel execution with host-device memory transfer. 
-  - Observed performance boost with non-default streams. 
-- Quantize
+  - Observed performance boost with non-default streams.
 - GEMV
 - Matrix Transpose
   - Naive GMEM
   - Padded SMEM Version with no bank conflicts
-- Im2col
 - SGEMM: Reaches 90% performance (avg over 100 times) of cuBLAS on 4096x4096x4096 FP32 SGEMM
   - Naive GEMM
   - Naive tiled SMEM (with bank conflicts) with vectorized loads and stores
