@@ -10,7 +10,6 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
-#include <thrust/equal.h>
 #include <thrust/execution_policy.h>
 #include <thrust/host_vector.h>
 
@@ -91,7 +90,6 @@ __device__ acc_t blockReduce(acc_t val)
 }
 
 
-/// alpha * A @ X + beta * Y.
 /// Each 1D block computes one element in output.
 template <
         int kBlockDimX, int kBlockDimY,
@@ -115,34 +113,27 @@ __global__ void gemvNaive(
 
     acc_t threadData;
 
-    // Grid Translation to cover all rows.
+    // Grid Translation.
     for (int gy = blockIdx.y * kBlockSpanY; gy < dm; gy += gridDim.x * kBlockSpanY)
     {
         threadData = 0;
 
-        // Block Translation to cover all columns.
-        for (int baseX = 0; baseX < dn; baseX += kBlockSpanX)
+        #pragma unroll
+        for (int packIdx = 0; packIdx < kThreadSpanX; ++packIdx)
         {
-            #pragma unroll
-            for (int packIdx = 0; packIdx < kThreadSpanX; ++packIdx)
-            {
-                // p0 p0 p0 ... p0   p1 p1 p1 ... p1   ...
-                const int gx = baseX + packIdx * kPackSize * kBlockDimX + threadIdx.x * kPackSize;
+            // p0 p0 p0 ... p0   p1 p1 p1 ... p1   ...
+            const int gx = packIdx * kPackSize * kBlockDimX + threadIdx.x * kPackSize;
 
-                if (gx < dn)
-                {
-                    threadData += a[gy * dn + gx] * x[gx];
-                }
+            if (gx < dn)
+            {
+                threadData += a[gy * dn + gx] * x[gx];
             }
         }
 
-        threadData = blockReduce<kBlockDimX, kBlockDimY>(threadData);
 
-        if (threadIdx.x == 0)
-        {
-            y[gy] = alpha * threadData + beta * y[gy];
-        }
     }
+
+
 }
 
 
@@ -173,62 +164,30 @@ void checkResult(const thrust::device_vector<acc_t> & result,
                  const thrust::device_vector<acc_t> & golden,
                  int dm)
 {
-    bool resultIsCorrect = thrust::equal(thrust::device, result.cbegin(), result.cend(), golden.cbegin(), Equal<acc_t>());
-
     if constexpr (kDebugOutput)
     {
-        if (!resultIsCorrect)
+        thrust::host_vector<acc_t> a = result;
+        thrust::host_vector<acc_t> b = golden;
+
+        printf("Result:\n");
+        for (int i = 0; i < dm; ++i)
         {
-            thrust::host_vector<acc_t> a = result;
-            thrust::host_vector<acc_t> b = golden;
-
-            printf("Result:\n");
-            for (int i = 0; i < dm; ++i)
-            {
-                printf("%f ", a[i]);
-                printf("\n");
-            }
-            printf("\n\n");
-
-            printf("Ground truth:\n");
-            for (int i = 0; i < dm; ++i)
-            {
-                printf("%f ", b[i]);
-                printf("\n");
-            }
-            printf("\n\n");
+            printf("%f ", a[i]);
+            printf("\n");
         }
+        printf("\n\n");
+
+        printf("Ground truth:\n");
+        for (int i = 0; i < dm; ++i)
+        {
+            printf("%f ", b[i]);
+            printf("\n");
+        }
+        printf("\n\n");
     }
 
+    bool resultIsCorrect = thrust::equal(thrust::device, result.cbegin(), result.cend(), golden.cbegin(), Equal<acc_t>());
     std::printf("Result is %s\n\n", resultIsCorrect ? "correct." : "WRONG!!!");
-}
-
-
-void displayInputs(const thrust::host_vector<float> & h_a,
-                   const thrust::host_vector<float> & h_x,
-                   int m,
-                   int n,
-                   float alpha,
-                   float beta)
-{
-    printf("alpha = %f, beta = %f\n", alpha, beta);
-
-    printf("A:\n");
-    for (int y = 0; y < m; ++y)
-    {
-        for (int x = 0; x < n; ++x)
-        {
-            printf("%6.0f ", h_a[y * n + x]);
-        }
-        printf("\n");
-    }
-
-    printf("X:\n");
-    for (int y = 0; y < m; ++y)
-    {
-        printf("%6.0f ", h_x[y]);
-    }
-    printf("\n");
 }
 
 
@@ -244,13 +203,17 @@ int main(int argc, char * argv[])
     ///                    Enable when checking correctness or profiling.
     ///                    Disable when debugging output.
     constexpr int kDup = 1;
-    constexpr bool kRandInput = true;
+    constexpr bool kRandInput = false;
 
     constexpr bool kTestGemvNaive = true;
     constexpr bool kTestGemvSmem = true;
 
     // Problem setting.
-    int problemSize = 1024;
+    // Tested on NVIDIA Geforce RTX 2080 Ti (kDup=100, kRandInput=true),
+    // gemmSmemPad reaches 80% cublasSgemm performance on m=n=k=2048,
+    //                     90% cublasSgemm performance on m=n=k=4096.
+    // It shows that CUBLAS_DEFAULT_MATH defaults to CUBLAS_TF32_TENSOR_OP_MATH.
+    int problemSize = 4;
     int m = problemSize;
     int n = problemSize;
     float alpha = 1.0f;
@@ -264,19 +227,14 @@ int main(int argc, char * argv[])
     if constexpr (kRandInput)
     {
         unsigned seed = std::random_device()();
-        // std::printf("seed = %u\n", seed);
         std::default_random_engine e(seed);
         // std::normal_distribution<float> d(0.0f, 1.0f);
         std::uniform_int_distribution d(1, 20);
         auto g = [&e, &d]() -> float { return d(e); };
-        alpha = g();
-        beta = g();
         std::generate(h_a.begin(), h_a.end(), g);
         std::generate(h_x.begin(), h_x.end(), g);
         std::generate(h_y.begin(), h_y.end(), g);
     }
-
-    // displayInputs(h_a, h_x, m, n, alpha, beta);
 
     thrust::device_vector<float> golden_y(n);
     thrust::device_vector<float> d_a = h_a;
@@ -317,8 +275,7 @@ int main(int argc, char * argv[])
     // GEMV Naive.
     if (kTestGemvNaive)
     {
-        d_y = h_y;
-        gemvNaive<kBlockDimX, kBlockDimY, kBlockSpanX, kBlockSpanY><<<grid, kBlock>>>(
+        gemvNaive<128, 1, kBlockSpanX, kBlockSpanY><<<grid, kBlock>>>(
                thrust::raw_pointer_cast(d_a.data()),
                thrust::raw_pointer_cast(d_x.data()),
                thrust::raw_pointer_cast(d_y.data()),
