@@ -151,19 +151,90 @@ __global__ void gemvNaive(
 }
 
 
-/// alpha * A @ X + beta * Y.
-/// Each 1D block computes one element in output.
-template <int kBlockDimX, int kBlockDimY, int kBlockSpanX, int kBlockSpanY>
-__global__ void gemvSmem(
-        const float * __restrict__ a,
-        const float * __restrict__ x,
-        float * __restrict__ y,
-        int dm,
-        int dn,
-        float alpha,
-        float beta)
+__device__ __forceinline__
+void fma(const float4 & a, float b, float4 & c)
 {
+    c.x += a.x * b;
+    c.y += a.y * b;
+    c.z += a.z * b;
+    c.w += a.w * b;
+}
 
+
+__device__ __forceinline__
+void add(const float4 & a, float4 & b)
+{
+    b.x += a.x;
+    b.y += a.y;
+    b.z += a.z;
+    b.w += a.w;
+}
+
+
+/// GEVM
+/// X [1, dn] @ A [dn, dm] --> Y [1, dm]
+/// X: Q @ K.T; A: V
+/// Each 1D thread block accumulates several rows in A (each row of shape [1, dm]).
+/// Each thread handles a vectorized pack in one row,
+/// and all threads will span multiple rows (strided w.r.t. block).
+/// All elements in one row in A multiply with the same element in X.
+template <int kBlockDimX, int kThreadsPerValue, typename Vec = float4>
+__global__ void gevm(
+        const float * __restrict__ x,
+        const float * __restrict__ a,
+        float * __restrict__ y,
+        int dn,
+        int dm)
+{
+    constexpr int kVecSize = sizeof(Vec) / sizeof(float);
+    constexpr int kBlockSpanY = kBlockDimX / kThreadsPerValue;
+
+    __shared__ float smem[512];
+
+    const int tid = threadIdx.x;
+
+    // This thread: (x, y) coordinate to load from matrix A.
+    const int ay = tid / kThreadsPerValue;
+    const int ax = (tid % kThreadsPerValue) * kVecSize;
+
+    float4 out = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // Gird translation.
+    // Reduces dn rows into kBlockSpanY rows.
+    for (int yy = ay; yy < dn; yy += kBlockSpanY)
+    {
+        float4 pack = *reinterpret_cast<const float4 *>(&a[yy * dm + ax]);
+        float logits = x[yy];
+        fma(pack, logits, out);
+    }
+
+    // Binary row-wise reduction.
+    // Now we have kBlockSpanY rows spanned across this block.
+    // We reduce them into one row and write back.
+    for (int rowsToReduce = kBlockSpanY; 1 < rowsToReduce; rowsToReduce >>= 1)
+    {
+        const int mid = rowsToReduce >> 1;
+
+        if (mid <= ay && ay < rowsToReduce)
+        {
+            *reinterpret_cast<float4 *>(&smem[(ay - mid) * dm + ax]) = out;
+        }
+
+        __syncthreads();
+
+        if (ay < mid)
+        {
+            add(*reinterpret_cast<float4 *>(&smem[ay * dm + ax]), out);
+        }
+
+        __syncthreads();
+    }
+
+    // Write back.
+    if (ay == 0)
+    {
+        *reinterpret_cast<float4 *>(&y[ax]) = out;
+    }
 }
 
 
@@ -265,13 +336,12 @@ int main(int argc, char * argv[])
     ///                    Enable when checking correctness or profiling.
     ///                    Disable when debugging output.
     constexpr int kDup = 1;
-    constexpr bool kRandInput = true;
+    constexpr bool kRandInput = false;
 
-    constexpr bool kTestGemvNaive = true;
-    constexpr bool kTestGemvSmem = true;
+    constexpr bool kTestGemvNaive = false;
 
     // Problem setting.
-    int problemSize = 1024;
+    int problemSize = 256;
     int m = problemSize;
     int n = problemSize;
     float alpha = 1.0f;
@@ -279,8 +349,8 @@ int main(int argc, char * argv[])
     thrust::host_vector<float> h_a(m * n, 1.0f);
     thrust::host_vector<float> h_x(m, 1.0f);
     thrust::host_vector<float> h_y(m, 0.0f);
-    std::iota(h_a.begin(), h_a.end(), 1.0f);
-    std::iota(h_x.begin(), h_x.end(), 1.0f);
+//    std::iota(h_a.begin(), h_a.end(), 1.0f);
+//    std::iota(h_x.begin(), h_x.end(), 1.0f);
 
     if constexpr (kRandInput)
     {
@@ -350,6 +420,25 @@ int main(int argc, char * argv[])
         CUDA_CHECK(cudaDeviceSynchronize());
         checkResult(d_y, golden_y, m);
     }
+
+    d_y = h_y;
+    constexpr int kBlockDimXX = 256;
+    gevm<kBlockDimXX, kBlockDimXX * sizeof(float) / 16><<<1, kBlockDimXX>>>(
+            thrust::raw_pointer_cast(d_x.data()),
+            thrust::raw_pointer_cast(d_a.data()),
+            thrust::raw_pointer_cast(d_y.data()),
+            m,
+            n
+    );
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    h_y = d_y;
+    for (auto y : h_y)
+    {
+        std::cout << y << ' ';
+    }
+    std::cout << '\n';
 
     // Free cuda resources.
     CUDA_CHECK(cudaEventDestroy(ss));

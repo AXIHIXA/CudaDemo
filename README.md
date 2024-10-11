@@ -34,7 +34,9 @@ More details are available in `src/utils/`.
     - Must use pinned host memory. 
     - Overlaps kernel execution with host-device memory transfer. 
   - Observed performance boost with non-default streams.
-- GEMV
+- GEMV 
+  - Naive GEMV kernel
+  - GEVM kernel for both fp32 and fp16 (vectorized loads and smem optimization)
 - Matrix Transpose
   - Naive GMEM
   - Padded SMEM Version with no bank conflicts

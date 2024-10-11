@@ -8,6 +8,7 @@
 #include <random>
 #include <vector>
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
 #include <thrust/equal.h>
@@ -17,212 +18,432 @@
 #include "utils/cuda_utils.h"
 
 
-__device__ __forceinline__
-void shfl_sync_up_b32(unsigned & d, unsigned & p, unsigned a, unsigned b, unsigned c, unsigned memberMask)
+/// GEMM kernel for fp32 with cuBLAS, calculating y == alpha * (A @ x) + beta.
+/// Used for ground truth calculation.
+/// cuBLAS matrices are in COLUMN-MAJOR, A should be transposed.
+/// \param[in] A      shape=(dm, dn)
+/// \param[in/out] B  shape=(dn, 1)
+void gemvCublas(const float * __restrict__ a,
+                const float * __restrict__ x,
+                float * __restrict__ y,
+                int dm,
+                int dn,
+                float alpha,
+                float beta,
+                cublasHandle_t handle)
 {
-    asm volatile("{\n"
-        ".reg .pred p;\n"
-        "shfl.sync.up.b32 %0|p, %2, %3, %4, %5;\n"
-        "selp.b32 %1, 1, 0, p;\n"
-        "}\n"
-            : "=r"(d), "=r"(p)
-            : "r"(a), "r"(b), "r"(c), "r"(memberMask));
+    CUBLAS_CHECK(
+        cublasSgemv(
+            handle, CUBLAS_OP_T,
+            dm, dn,
+            &alpha,
+            a, dn,
+            x, 1,
+            &beta,
+            y, 1
+        )
+    );
 }
 
 
-template <typename ScanOp, typename T, int kWarpThreads = 32>
-__device__ void warpScan(int laneIdx, T & input, T & inclusiveOutput, T & exclusiveOutput, ScanOp & scanOp)
+template <typename acc_t, int kWarpThreads = 32>
+__device__ acc_t warpReduce(acc_t val)
 {
     static_assert(kWarpThreads == 32);
 
-    inclusiveOutput = input;
-
     #pragma unroll
-    for (int step = 1; step <= (kWarpThreads >> 1); step <<= 1)
+    for (int step = (kWarpThreads >> 1); 0 < step; step >>= 1)
     {
-        // All lanes must actively participate in warp shuffle.
-        // Needs lined PTX if splitting warps.
-        T temp = __shfl_up_sync(0xffffffff, inclusiveOutput, step, kWarpThreads);
-
-        // Only scan with a valid peer; do not scan with self.
-        if (step <= laneIdx)
-        {
-            inclusiveOutput = scanOp(inclusiveOutput, temp);
-        }
+        val += __shfl_xor_sync(0xffffffff, val, step, kWarpThreads);
     }
 
-    exclusiveOutput = __shfl_up_sync(0xffffffff, inclusiveOutput, 1, kWarpThreads);
+    return val;
 }
 
 
-template <int kBlockDimX, int kWarpThreads = 32, typename ScanOp, typename T>
-__device__ void blockScan(T & input, T & inclusiveOutput, T & exclusiveOutput, T & blockAggregate, ScanOp scanOp)
+template <int kBlockDimX, int kBlockDimY, int kWarpThreads = 32, typename acc_t>
+__device__ acc_t blockReduce(acc_t val)
 {
-    static_assert(kBlockDimX % kWarpThreads == 0 && kWarpThreads == 32);
+    static_assert(kBlockDimX % kWarpThreads == 0 && kBlockDimY == 1 && kWarpThreads == 32);
     constexpr int kWarps = kBlockDimX / kWarpThreads;
-    __shared__ T warpAggregate[kWarps];
+    val = warpReduce(val);
 
-    // Warp scan.
-    const int tid = threadIdx.x;
-    const int laneIdx = tid % kWarpThreads;
-    const int warpIdx = tid / kWarpThreads;
+    __shared__ acc_t warpAggregate[kWarps];
 
-    // Exclusive output for lane0s in all warps are invalid.
-    warpScan(laneIdx, input, inclusiveOutput, exclusiveOutput, scanOp);
+    const int laneIdx = threadIdx.x % kWarpThreads;
+    const int warpIdx = threadIdx.x / kWarpThreads;
 
-    // NOTE:
-    // Last lane in warp, we DON't want "incomplete warps"!
-    // Make block size a multiple of 32!
-    if (laneIdx == kWarpThreads - 1)
+    if (warpIdx < kWarps && laneIdx == 0)
     {
-        warpAggregate[warpIdx] = inclusiveOutput;
+        warpAggregate[warpIdx] = val;
     }
 
     __syncthreads();
 
-    // Compute warp prefix.
-    T warpPrefix = {};
-    T regBlockAgg = warpAggregate[0];
+    val = 0;
 
     #pragma unroll
-    for (int warp = 1; warp < kWarps; ++warp)
+    for (int warp = 0; warp < kWarps; ++warp)
     {
-        if (warpIdx == warp)
+        val += warpAggregate[warp];
+    }
+
+    return val;
+}
+
+
+/// alpha * A @ X + beta * Y.
+/// Each 1D block computes one element in output.
+template <int kBlockDimX, int kBlockDimY>
+__global__ void gemvNaive(
+        const float * __restrict__ a,
+        const float * __restrict__ x,
+        float * __restrict__ y,
+        int dm,
+        int dn,
+        float alpha,
+        float beta)
+{
+    // Alignment requirements for float4 vectorized loads/stores.
+    // Note that this works only for Debug builds...
+    assert(dm % 4 == 0);
+
+    static_assert(kBlockDimY == 1);
+    constexpr int kPackSize = 4;
+    constexpr int kBlockSpanX = kPackSize * kBlockDimX;
+
+    float4 threadData;
+
+    // Grid Translation to cover all rows.
+    for (int gy = blockIdx.y; gy < dm; gy += gridDim.x)
+    {
+        threadData.x = 0;
+        threadData.y = 0;
+        threadData.z = 0;
+        threadData.w = 0;
+
+        // Block Translation to cover all columns.
+        for (int baseX = 0; baseX < dn; baseX += kBlockSpanX)
         {
-            warpPrefix = regBlockAgg;
+            const int gx = baseX + threadIdx.x * kPackSize;
+
+            if (gx < dn)
+            {
+                float4 a4 = *reinterpret_cast<const float4 *>(a + gy * dn + gx);
+                float4 x4 = *reinterpret_cast<const float4 *>(x + gx);
+                threadData.x += a4.x * x4.x;
+                threadData.y += a4.y * x4.y;
+                threadData.z += a4.z * x4.z;
+                threadData.w += a4.w * x4.w;
+            }
         }
 
-        regBlockAgg = scanOp(regBlockAgg, warpAggregate[warp]);
-    }
+        threadData.x = blockReduce<kBlockDimX, kBlockDimY>(threadData.x);
+        threadData.y = blockReduce<kBlockDimX, kBlockDimY>(threadData.y);
+        threadData.z = blockReduce<kBlockDimX, kBlockDimY>(threadData.z);
+        threadData.w = blockReduce<kBlockDimX, kBlockDimY>(threadData.w);
 
-    if (tid == 0)
-    {
-        blockAggregate = regBlockAgg;
-    }
-
-    // Apply warp prefix.
-    if (0 < warpIdx)
-    {
-        inclusiveOutput = scanOp(inclusiveOutput, warpPrefix);
-        exclusiveOutput = laneIdx == 0 ? warpPrefix : scanOp(exclusiveOutput, warpPrefix);
+        if (threadIdx.x == 0)
+        {
+            y[gy] = alpha * (threadData.x + threadData.y + threadData.z + threadData.w) + beta * y[gy];
+        }
     }
 }
 
 
-template <int kBlockDimX, int kThreadSpan, int kWarpThreads = 32, typename ScanOp, typename T>
-__device__ void blockScan(T (& input)[kThreadSpan],
-                          T (& inclusiveOutput)[kThreadSpan],
-                          T & blockAggregate,
-                          ScanOp scanOp)
+__device__ __forceinline__
+void fma(const float4 & a, float b, float4 & c)
 {
-    // Trivial case: One-element array.
-    T sink;
+    c.x += a.x * b;
+    c.y += a.y * b;
+    c.z += a.z * b;
+    c.w += a.w * b;
+}
 
-    if constexpr (kThreadSpan == 1)
-    {
-        blockScan<kBlockDimX>(input[0], inclusiveOutput[0], sink, blockAggregate, scanOp);
-        return;
-    }
 
-    // Thread aggregate by thread level reduction.
-    T threadPrefix = input[0];
+__device__ __forceinline__
+void add(const float4 & a, float4 & b)
+{
+    b.x += a.x;
+    b.y += a.y;
+    b.z += a.z;
+    b.w += a.w;
+}
 
-    #pragma unroll
-    for (int i = 1; i < kThreadSpan; ++i)
-    {
-        threadPrefix = scanOp(threadPrefix, input[i]);
-    }
 
-    // Block level exclusive scan. Scans thread aggregates into thread prefixes.
-    blockScan<kBlockDimX>(threadPrefix, sink, threadPrefix, blockAggregate, scanOp);
+/// GEVM
+/// X [1, dn] @ A [dn, dm] --> Y [1, dm]
+/// X: Q @ K.T; A: V
+/// Each 1D thread block accumulates several rows in A (each row of shape [1, dm]).
+/// Each thread handles a vectorized pack in one row,
+/// and all threads will span multiple rows (strided w.r.t. block).
+/// All elements in one row in A multiply with the same element in X.
+template <int kBlockDimX, int kThreadsPerValue, typename Vec = float4>
+__global__ void gevm(
+        const float * __restrict__ x,
+        const float * __restrict__ a,
+        float * __restrict__ y,
+        int dn,
+        int dm)
+{
+    constexpr int kVecSize = sizeof(Vec) / sizeof(float);
+    constexpr int kBlockSpanY = kBlockDimX / kThreadsPerValue;
 
-    // Thread level scan with prefixes.
-    // Note that exclusive scan output for 0-th element is invalid.
+    __shared__ float smem[512];
+
     const int tid = threadIdx.x;
 
-    inclusiveOutput[0] = 0 < tid ? scanOp(input[0], threadPrefix) : input[0];
+    // This thread: (x, y) coordinate to load from matrix A.
+    const int ay = tid / kThreadsPerValue;
+    const int ax = (tid % kThreadsPerValue) * kVecSize;
 
-    #pragma unroll
-    for (int i = 1; i < kThreadSpan; ++i)
+    float4 out = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // Gird translation.
+    // Reduces dn rows into kBlockSpanY rows.
+    for (int yy = ay; yy < dn; yy += kBlockSpanY)
     {
-        inclusiveOutput[i] = scanOp(inclusiveOutput[i - 1], input[i]);
+        float4 pack = *reinterpret_cast<const float4 *>(&a[yy * dm + ax]);
+        float logits = x[yy];
+        fma(pack, logits, out);
     }
 
-    #if false
-    static_assert(kThreadSpan == 4);
-    printf("tid %d input = %d %d %d %d prefix = %d output = %d %d %d %d\n",
-           tid,
-           input[0], input[1], input[2], input[3],
-           threadPrefix,
-           inclusiveOutput[0], inclusiveOutput[1], inclusiveOutput[2], inclusiveOutput[3]
-    );
-    #endif  // false
+    // Binary row-wise reduction.
+    // Now we have kBlockSpanY rows spanned across this block.
+    // We reduce them into one row and write back.
+    for (int rowsToReduce = kBlockSpanY; 1 < rowsToReduce; rowsToReduce >>= 1)
+    {
+        const int mid = rowsToReduce >> 1;
+
+        if (mid <= ay && ay < rowsToReduce)
+        {
+            *reinterpret_cast<float4 *>(&smem[(ay - mid) * dm + ax]) = out;
+        }
+
+        __syncthreads();
+
+        if (ay < mid)
+        {
+            add(*reinterpret_cast<float4 *>(&smem[ay * dm + ax]), out);
+        }
+
+        __syncthreads();
+    }
+
+    // Write back.
+    if (ay == 0)
+    {
+        *reinterpret_cast<float4 *>(&y[ax]) = out;
+    }
 }
 
 
-template <int kBlockDimX, int kThreadSpan, int kWarpThreads = 32, typename ScanOp, typename T>
-__global__ void inclusiveScan(T * input,
-                              T * inclusiveOutput,
-                              int nx,
-                              ScanOp scanOp)
+template <typename T>
+struct Equal
 {
-    const int gx = blockIdx.x * kBlockDimX * kThreadSpan + threadIdx.x * kThreadSpan;
-    T x[kThreadSpan];
+    __host__ __device__
+    inline bool operator()(const T & a, const T & b) = delete;
+};
 
-    #pragma unroll
-    for (int i = 0; i < kThreadSpan; ++i)
+
+template <>
+struct Equal<float>
+{
+    __host__ __device__
+    inline bool operator()(float a, float b)
     {
-        if (gx + i < nx)
+        return abs(a - b) < kAbsTol + kRelTol * abs(b);
+    }
+
+    static constexpr float kAbsTol = 1e-3f;
+    static constexpr float kRelTol = 2e-4f;
+};
+
+
+template <bool kDebugOutput = true, typename acc_t>
+void checkResult(const thrust::device_vector<acc_t> & result,
+                 const thrust::device_vector<acc_t> & golden,
+                 int dm)
+{
+    bool resultIsCorrect = thrust::equal(thrust::device, result.cbegin(), result.cend(), golden.cbegin(), Equal<acc_t>());
+
+    if constexpr (kDebugOutput)
+    {
+        if (!resultIsCorrect)
         {
-            x[i] = input[gx + i];
+            thrust::host_vector<acc_t> a = result;
+            thrust::host_vector<acc_t> b = golden;
+
+            printf("Result:\n");
+            for (int i = 0; i < dm; ++i)
+            {
+                printf("%f ", a[i]);
+                printf("\n");
+            }
+            printf("\n\n");
+
+            printf("Ground truth:\n");
+            for (int i = 0; i < dm; ++i)
+            {
+                printf("%f ", b[i]);
+                printf("\n");
+            }
+            printf("\n\n");
         }
     }
 
-    T threadInclusiveOutput[kThreadSpan];
-    T blockAggregate;
-    blockScan<kBlockDimX, kThreadSpan>(x, threadInclusiveOutput, blockAggregate, scanOp);
+    std::printf("Result is %s\n\n", resultIsCorrect ? "correct." : "WRONG!!!");
+}
 
-    // TODO Intra-block blockAggregate scan on GMEM temp storage.
 
-    #pragma unroll
-    for (int i = 0; i < kThreadSpan; ++i)
+void displayInputs(const thrust::host_vector<float> & h_a,
+                   const thrust::host_vector<float> & h_x,
+                   int m,
+                   int n,
+                   float alpha,
+                   float beta)
+{
+    printf("alpha = %f, beta = %f\n", alpha, beta);
+
+    printf("A:\n");
+    for (int y = 0; y < m; ++y)
     {
-        if (gx + i < nx)
+        for (int x = 0; x < n; ++x)
         {
-            inclusiveOutput[gx + i] = threadInclusiveOutput[i];
+            printf("%6.0f ", h_a[y * n + x]);
         }
+        printf("\n");
     }
+
+    printf("X:\n");
+    for (int y = 0; y < m; ++y)
+    {
+        printf("%6.0f ", h_x[y]);
+    }
+    printf("\n");
 }
 
 
 int main(int argc, char * argv[])
 {
-    using T = int;
-    const int nx = 2067;
-    thrust::device_vector<T> devInput(nx, 1);
-    thrust::device_vector<T> devInclusiveOutput(nx, 1);
-    thrust::device_vector<T> devTempStorage(nx);
+    /// Switches for debugging output correctness.
+    /// \param kDup        Set to 1 to debug output (kernel only launched once) and results will be checked.
+    ///                    Set to values greater than 1 to profile.
+    ///                    In the latter case, results will NOT be checked because it's in-place GEMM.
+    ///                    We do not dispatch by build type because we have -G flag for Debug builds
+    ///                    (that's for debugging runtime errors).
+    /// \param kRandInput  Whether we random input matrices.
+    ///                    Enable when checking correctness or profiling.
+    ///                    Disable when debugging output.
+    constexpr int kDup = 1;
+    constexpr bool kRandInput = false;
 
-    constexpr int kThreadSpan = 4;
-    constexpr int threadsNeeded = (nx + kThreadSpan - 1) / kThreadSpan;
-    constexpr int nearestGreaterMultipleOf32 = (threadsNeeded + 31) / 32 * 32;
-    constexpr dim3 kBlock(nearestGreaterMultipleOf32, 1);
-    inclusiveScan<kBlock.x, kThreadSpan><<<1, kBlock>>>(
-            thrust::raw_pointer_cast(devInput.data()),
-            thrust::raw_pointer_cast(devInclusiveOutput.data()),
-            nx,
-            cub::Sum()
+    constexpr bool kTestGemvNaive = false;
+
+    // Problem setting.
+    int problemSize = 256;
+    int m = problemSize;
+    int n = problemSize;
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    thrust::host_vector<float> h_a(m * n, 1.0f);
+    thrust::host_vector<float> h_x(m, 1.0f);
+    thrust::host_vector<float> h_y(m, 0.0f);
+//    std::iota(h_a.begin(), h_a.end(), 1.0f);
+//    std::iota(h_x.begin(), h_x.end(), 1.0f);
+
+    if constexpr (kRandInput)
+    {
+        unsigned seed = std::random_device()();
+        // std::printf("seed = %u\n", seed);
+        std::default_random_engine e(seed);
+        // std::normal_distribution<float> d(0.0f, 1.0f);
+        std::uniform_int_distribution d(1, 20);
+        auto g = [&e, &d]() -> float { return d(e); };
+        alpha = g();
+        beta = g();
+        std::generate(h_a.begin(), h_a.end(), g);
+        std::generate(h_x.begin(), h_x.end(), g);
+        std::generate(h_y.begin(), h_y.end(), g);
+    }
+
+    // displayInputs(h_a, h_x, m, n, alpha, beta);
+
+    thrust::device_vector<float> golden_y(n);
+    thrust::device_vector<float> d_a = h_a;
+    thrust::device_vector<float> d_x = h_x;
+    thrust::device_vector<float> d_y = h_y;
+
+    // CUDA resources that require manual destruction.
+    float ms;
+    cudaEvent_t ss, ee;
+    CUDA_CHECK(cudaEventCreate(&ss));
+    CUDA_CHECK(cudaEventCreate(&ee));
+
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+
+    // Testing says that these two modes are the same.
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
+    // CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
+
+    // Compute ground truth with cuBLAS.
+    gemvCublas(thrust::raw_pointer_cast(d_a.data()),
+               thrust::raw_pointer_cast(d_x.data()),
+               thrust::raw_pointer_cast(d_y.data()),
+               m,
+               n,
+               alpha,
+               beta,
+               handle);
+    golden_y = d_y;
+
+    constexpr int kBlockDimX = 128;
+    constexpr int kBlockDimY = 1;
+    constexpr dim3 kBlock(kBlockDimX, kBlockDimY);
+    dim3 grid(std::min(1, m >> 1));
+
+    // GEMV Naive.
+    if (kTestGemvNaive)
+    {
+        d_y = h_y;
+        gemvNaive<kBlockDimX, kBlockDimY><<<grid, kBlock>>>(
+               thrust::raw_pointer_cast(d_a.data()),
+               thrust::raw_pointer_cast(d_x.data()),
+               thrust::raw_pointer_cast(d_y.data()),
+               m,
+               n,
+               alpha,
+               beta
+        );
+        CUDA_CHECK_LAST_ERROR();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        checkResult(d_y, golden_y, m);
+    }
+
+    d_y = h_y;
+    constexpr int kBlockDimXX = 256;
+    gevm<kBlockDimXX, kBlockDimXX * sizeof(float) / 16><<<1, kBlockDimXX>>>(
+            thrust::raw_pointer_cast(d_x.data()),
+            thrust::raw_pointer_cast(d_a.data()),
+            thrust::raw_pointer_cast(d_y.data()),
+            m,
+            n
     );
     CUDA_CHECK_LAST_ERROR();
     CUDA_CHECK(cudaDeviceSynchronize());
-    thrust::host_vector<T> hostInclusiveOutput = devInclusiveOutput;
 
-    for (auto x : hostInclusiveOutput)
+    h_y = d_y;
+    for (auto y : h_y)
     {
-        std::cout << x << ' ';
+        std::cout << y << ' ';
     }
-
     std::cout << '\n';
+
+    // Free cuda resources.
+    CUDA_CHECK(cudaEventDestroy(ss));
+    CUDA_CHECK(cudaEventDestroy(ee));
+    CUBLAS_CHECK(cublasDestroy_v2(handle));
 
     return EXIT_SUCCESS;
 }
