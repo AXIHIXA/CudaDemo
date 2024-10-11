@@ -38,6 +38,8 @@ More details are available in `src/utils/`.
 - Matrix Transpose
   - Naive GMEM
   - Padded SMEM Version with no bank conflicts
+- Parallel Scan
+  - Block scan routine with warp shuffle intrinsics. 
 - SGEMM: Reaches 90% performance (avg over 100 times) of cuBLAS on 4096x4096x4096 FP32 SGEMM
   - Naive GEMM
   - Naive tiled SMEM (with bank conflicts) with vectorized loads and stores
