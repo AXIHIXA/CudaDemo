@@ -38,6 +38,8 @@ More details are available in `src/utils/`.
   - GEMV kernel for fp32
   - GEVM kernel for both fp32 and fp16
   - Uses vectorized loads and SMEM optimization
+- Dropout: `src/utils/16_dropout`
+  - Fuse mask generation and scaling into one kernel.
 - Matrix Transpose: `src/utils/80_transpose`
   - Naive GMEM
   - Padded SMEM Version with no bank conflicts
