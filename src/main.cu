@@ -50,10 +50,10 @@ struct UniformDistribution<float>
 
 
 template <typename T>
-struct DstMaskFunctor
+struct Dropout
 {
-    __device__ DstMaskFunctor(const float dropoutProb,
-                              const bool isScale) :
+    __device__ Dropout(const float dropoutProb,
+                       const bool isScale) :
             prob(dropoutProb),
             isScale(isScale),
             invProb(1.0f / (1.0f - dropoutProb))
@@ -72,7 +72,7 @@ struct DstMaskFunctor
         {
             if (rand[i] < prob)
             {
-                auto zero = static_cast<T>(0);
+                const auto zero = static_cast<T>(0);
                 dst[i] = zero;
                 dst[i + kCount] = zero;
             }
@@ -90,15 +90,15 @@ struct DstMaskFunctor
 };
 
 
-__global__ void dropout(int nx,
-                        int seed,
-                        const float dropoutProb,
-                        const float * __restrict__ src,
-                        uint8_t * __restrict__ mask,
-                        float * __restrict__ dst,
-                        bool isScale,
-                        int increment,
-                        int mainOffset)
+__global__ void dropoutKernel(int nx,
+                              int seed,
+                              const float dropoutProb,
+                              const float * __restrict__ src,
+                              uint8_t * __restrict__ mask,
+                              float * __restrict__ dst,
+                              bool isScale,
+                              int increment,
+                              int mainOffset)
 {
     const int tid = threadIdx.x;
     const int threads = blockDim.x;
@@ -119,7 +119,7 @@ __global__ void dropout(int nx,
     curand_init(seed, blockOffset + tid, increment, &state);
 
     UniformDistribution<float> rand4 = {};
-    DstMaskFunctor<float> applyDropout(dropoutProb, isScale);
+    Dropout<float> dropout(dropoutProb, isScale);
 
     // 0        ~ VecSize - 1     : dst
     // VecSize  ~ 2 * VecSize - 1 : mask
@@ -149,7 +149,7 @@ __global__ void dropout(int nx,
         }
 
         // Computation
-        applyDropout(&regDstMask[0], &regRands[0], &regDstMask[0]);
+        dropout(&regDstMask[0], &regRands[0], &regDstMask[0]);
 
         // Write-back
         reinterpret_cast<fvec4_t *>(dst + start)[threadOffset] = *(reinterpret_cast<fvec4_t *>(&regDstMask[0]));
@@ -183,7 +183,7 @@ __global__ void dropout(int nx,
         }
 
         // Computation
-        applyDropout(&regDstMask[0], &regRands[0], &regDstMask[0]);
+        dropout(&regDstMask[0], &regRands[0], &regDstMask[0]);
 
         // Write-back
         for (int i = 0; i < kVecSize; ++i)
@@ -230,7 +230,7 @@ int main(int argc, char * argv[])
         // Only applies to 1D data layout.
         const int mainOffset = nx / (grid.x * block.x * kRandVecSize) * (grid.x * block.x * kRandVecSize);
 
-        dropout<<<grid, block>>>(
+        dropoutKernel<<<grid, block>>>(
                 nx,
                 seed,
                 dropoutProb,
