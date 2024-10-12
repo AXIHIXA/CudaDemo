@@ -18,11 +18,12 @@
 #include "utils/cuda_utils.h"
 
 
-/// GEMM kernel for fp32 with cuBLAS, calculating y == alpha * (A @ x) + beta.
+/// GEMV kernel for fp32 with cuBLAS, calculating y == alpha * (A @ x) + beta * y.
 /// Used for ground truth calculation.
 /// cuBLAS matrices are in COLUMN-MAJOR, A should be transposed.
-/// \param[in] A      shape=(dm, dn)
-/// \param[in/out] B  shape=(dn, 1)
+/// \param[in] a      shape=(dm, dn)
+/// \param[in] x      shape=(dn, 1)
+/// \param[in/out] y  shape=(dn, 1)
 void gemvCublas(const float * __restrict__ a,
                 const float * __restrict__ x,
                 float * __restrict__ y,
@@ -35,6 +36,35 @@ void gemvCublas(const float * __restrict__ a,
     CUBLAS_CHECK(
         cublasSgemv(
             handle, CUBLAS_OP_T,
+            dm, dn,
+            &alpha,
+            a, dn,
+            x, 1,
+            &beta,
+            y, 1
+        )
+    );
+}
+
+
+/// GEVM kernel for fp32 with cuBLAS, calculating y == alpha * (x @ A) + beta * y
+/// Used for ground truth calculation.
+/// cuBLAS matrices are in COLUMN-MAJOR, A should be transposed.
+/// \param[in] x      shape=(1, dm)
+/// \param[in] a      shape=(dm, dn)
+/// \param[in/out] y  shape=(1, dn)
+void gevmCublas(const float * __restrict__ x,
+                const float * __restrict__ a,
+                float * __restrict__ y,
+                int dm,
+                int dn,
+                float alpha,
+                float beta,
+                cublasHandle_t handle)
+{
+    CUBLAS_CHECK(
+        cublasSgemv(
+            handle, CUBLAS_OP_N,
             dm, dn,
             &alpha,
             a, dn,
@@ -152,22 +182,26 @@ __global__ void gemvNaive(
 
 
 __device__ __forceinline__
-void fma(const float4 & a, float b, float4 & c)
+float4 fma(const float4 & a, float b, const float4 & c)
 {
-    c.x += a.x * b;
-    c.y += a.y * b;
-    c.z += a.z * b;
-    c.w += a.w * b;
+    float4 ret;
+    ret.x = a.x * b + c.x;
+    ret.y = a.y * b + c.y;
+    ret.z = a.z * b + c.z;
+    ret.w = a.w * b + c.w;
+    return ret;
 }
 
 
 __device__ __forceinline__
-void add(const float4 & a, float4 & b)
+float4 add(const float4 & a, const float4 & b)
 {
-    b.x += a.x;
-    b.y += a.y;
-    b.z += a.z;
-    b.w += a.w;
+    float4 ret;
+    ret.x = a.x + b.x;
+    ret.y = a.y + b.y;
+    ret.z = a.z + b.z;
+    ret.w = a.w + b.w;
+    return ret;
 }
 
 
@@ -186,10 +220,13 @@ __global__ void gevm(
         int dn,
         int dm)
 {
+    static_assert(std::is_same_v<Vec, float4>);
+
     constexpr int kVecSize = sizeof(Vec) / sizeof(float);
     constexpr int kBlockSpanY = kBlockDimX / kThreadsPerValue;
 
-    __shared__ float smem[512];
+    extern __shared__ unsigned char smem[];
+    auto rowBuf = reinterpret_cast<float *>(smem);
 
     const int tid = threadIdx.x;
 
@@ -197,15 +234,15 @@ __global__ void gevm(
     const int ay = tid / kThreadsPerValue;
     const int ax = (tid % kThreadsPerValue) * kVecSize;
 
-    float4 out = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    Vec out = {};
 
     // Gird translation.
     // Reduces dn rows into kBlockSpanY rows.
     for (int yy = ay; yy < dn; yy += kBlockSpanY)
     {
-        float4 pack = *reinterpret_cast<const float4 *>(&a[yy * dm + ax]);
+        Vec pack = *reinterpret_cast<const Vec *>(&a[yy * dm + ax]);
         float logits = x[yy];
-        fma(pack, logits, out);
+        out = fma(pack, logits, out);
     }
 
     // Binary row-wise reduction.
@@ -217,14 +254,14 @@ __global__ void gevm(
 
         if (mid <= ay && ay < rowsToReduce)
         {
-            *reinterpret_cast<float4 *>(&smem[(ay - mid) * dm + ax]) = out;
+            *reinterpret_cast<Vec *>(&rowBuf[(ay - mid) * dm + ax]) = out;
         }
 
         __syncthreads();
 
         if (ay < mid)
         {
-            add(*reinterpret_cast<float4 *>(&smem[ay * dm + ax]), out);
+            out = add(*reinterpret_cast<Vec *>(&rowBuf[ay * dm + ax]), out);
         }
 
         __syncthreads();
@@ -233,7 +270,112 @@ __global__ void gevm(
     // Write back.
     if (ay == 0)
     {
-        *reinterpret_cast<float4 *>(&y[ax]) = out;
+        *reinterpret_cast<Vec *>(&y[ax]) = out;
+    }
+}
+
+
+struct alignas(16) half8
+{
+    half2 h1 = make_half2(0, 0);
+    half2 h2 = make_half2(0, 0);
+    half2 h3 = make_half2(0, 0);
+    half2 h4 = make_half2(0, 0);
+};
+
+
+__device__ __forceinline__
+half8 fma(const half8 & a, half b, const half8 & c)
+{
+    half8 ret;
+    half2 b2 = make_half2(b, b);
+    // In case __CUDA_NO_HALF2_OPERATORS__ is defined.
+    ret.h1 = __hadd2(__hmul2(a.h1, b2), c.h1);
+    ret.h2 = __hadd2(__hmul2(a.h2, b2), c.h2);
+    ret.h3 = __hadd2(__hmul2(a.h3, b2), c.h3);
+    ret.h4 = __hadd2(__hmul2(a.h4, b2), c.h4);
+    return ret;
+}
+
+
+__device__ __forceinline__
+half8 add(const half8 & a, const half8 & b)
+{
+    half8 ret;
+    ret.h1 = __hadd2(a.h1, b.h1);
+    ret.h2 = __hadd2(a.h2, b.h2);
+    ret.h3 = __hadd2(a.h3, b.h3);
+    ret.h4 = __hadd2(a.h4, b.h4);
+    return ret;
+}
+
+
+///// GEVM for FP16.
+///// X [1, dn] @ A [dn, dm] --> Y [1, dm]
+///// X: Q @ K.T; A: V
+///// Each 1D thread block accumulates several rows in A (each row of shape [1, dm]).
+///// Each thread handles a vectorized pack in one row,
+///// and all threads will span multiple rows (strided w.r.t. block).
+///// All elements in one row in A multiply with the same element in X.
+template <int kBlockDimX, int kThreadsPerValue, typename Vec = half8>
+__global__ void gevm(
+        const half * __restrict__ x,
+        const half * __restrict__ a,
+        half * __restrict__ y,
+        int dn,
+        int dm)
+{
+    static_assert(std::is_same_v<Vec, half8>);
+
+    constexpr int kVecSize = sizeof(Vec) / sizeof(half);
+    constexpr int kBlockSpanY = kBlockDimX / kThreadsPerValue;
+
+    extern __shared__ unsigned char smem[];
+    auto rowBuf = reinterpret_cast<half *>(smem);
+
+    const int tid = threadIdx.x;
+
+    // This thread: (x, y) coordinate to load from matrix A.
+    const int ay = tid / kThreadsPerValue;
+    const int ax = (tid % kThreadsPerValue) * kVecSize;
+
+    half8 out = {};
+
+    // Gird translation.
+    // Reduces dn rows into kBlockSpanY rows.
+    for (int yy = ay; yy < dn; yy += kBlockSpanY)
+    {
+        half8 pack = *reinterpret_cast<const half8 *>(&a[yy * dm + ax]);
+        half logits = x[yy];
+        out = fma(pack, logits, out);
+    }
+
+    // Binary row-wise reduction.
+    // Now we have kBlockSpanY rows spanned across this block.
+    // We reduce them into one row and write back.
+    for (int rowsToReduce = kBlockSpanY; 1 < rowsToReduce; rowsToReduce >>= 1)
+    {
+        const int mid = rowsToReduce >> 1;
+
+        if (mid <= ay && ay < rowsToReduce)
+        {
+            *reinterpret_cast<Vec *>(&rowBuf[(ay - mid) * dm + ax]) = out;
+        }
+
+        __syncthreads();
+
+        if (ay < mid)
+        {
+            out = add(*reinterpret_cast<Vec *>(&rowBuf[ay * dm + ax]), out);
+        }
+
+        __syncthreads();
+    }
+
+    // Write back.
+    if (ay == 0)
+    {
+        *reinterpret_cast<Vec *>(&y[ax]) = out;
     }
 }
 
@@ -277,16 +419,14 @@ void checkResult(const thrust::device_vector<acc_t> & result,
             printf("Result:\n");
             for (int i = 0; i < dm; ++i)
             {
-                printf("%f ", a[i]);
-                printf("\n");
+                printf("%6.2f ", a[i]);
             }
             printf("\n\n");
 
             printf("Ground truth:\n");
             for (int i = 0; i < dm; ++i)
             {
-                printf("%f ", b[i]);
-                printf("\n");
+                printf("%6.2f ", b[i]);
             }
             printf("\n\n");
         }
@@ -339,16 +479,18 @@ int main(int argc, char * argv[])
     constexpr bool kRandInput = false;
 
     constexpr bool kTestGemvNaive = false;
+    constexpr bool kTestGevmFp32 = false;
+    constexpr bool kTestGevmFp16 = true;
 
     // Problem setting.
-    int problemSize = 256;
-    int m = problemSize;
-    int n = problemSize;
+    const int problemSize = 1024;
+    const int m = problemSize;
+    const int n = problemSize;
     float alpha = 1.0f;
     float beta = 0.0f;
     thrust::host_vector<float> h_a(m * n, 1.0f);
     thrust::host_vector<float> h_x(m, 1.0f);
-    thrust::host_vector<float> h_y(m, 0.0f);
+    thrust::host_vector<float> h_y(std::max(m, n), 0.0f);
 //    std::iota(h_a.begin(), h_a.end(), 1.0f);
 //    std::iota(h_x.begin(), h_x.end(), 1.0f);
 
@@ -387,26 +529,28 @@ int main(int argc, char * argv[])
     CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
     // CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
 
-    // Compute ground truth with cuBLAS.
-    gemvCublas(thrust::raw_pointer_cast(d_a.data()),
-               thrust::raw_pointer_cast(d_x.data()),
-               thrust::raw_pointer_cast(d_y.data()),
-               m,
-               n,
-               alpha,
-               beta,
-               handle);
-    golden_y = d_y;
-
-    constexpr int kBlockDimX = 128;
-    constexpr int kBlockDimY = 1;
-    constexpr dim3 kBlock(kBlockDimX, kBlockDimY);
-    dim3 grid(std::min(1, m >> 1));
-
     // GEMV Naive.
     if (kTestGemvNaive)
     {
+        // Compute GEMV ground truth with cuBLAS.
+        gemvCublas(thrust::raw_pointer_cast(d_a.data()),
+                   thrust::raw_pointer_cast(d_x.data()),
+                   thrust::raw_pointer_cast(d_y.data()),
+                   m,
+                   n,
+                   alpha,
+                   beta,
+                   handle);
+        golden_y = d_y;
+
+        // GEMV
         d_y = h_y;
+
+        constexpr int kBlockDimX = 128;
+        constexpr int kBlockDimY = 1;
+        constexpr dim3 kBlock(kBlockDimX, kBlockDimY);
+        dim3 grid(std::min(1, m >> 1));
+
         gemvNaive<kBlockDimX, kBlockDimY><<<grid, kBlock>>>(
                thrust::raw_pointer_cast(d_a.data()),
                thrust::raw_pointer_cast(d_x.data()),
@@ -418,27 +562,83 @@ int main(int argc, char * argv[])
         );
         CUDA_CHECK_LAST_ERROR();
         CUDA_CHECK(cudaDeviceSynchronize());
+
         checkResult(d_y, golden_y, m);
     }
 
-    d_y = h_y;
-    constexpr int kBlockDimXX = 256;
-    gevm<kBlockDimXX, kBlockDimXX * sizeof(float) / 16><<<1, kBlockDimXX>>>(
-            thrust::raw_pointer_cast(d_x.data()),
-            thrust::raw_pointer_cast(d_a.data()),
-            thrust::raw_pointer_cast(d_y.data()),
-            m,
-            n
-    );
-    CUDA_CHECK_LAST_ERROR();
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    h_y = d_y;
-    for (auto y : h_y)
+    if constexpr (kTestGevmFp32)
     {
-        std::cout << y << ' ';
+        // Compute GEMV ground truth with cuBLAS.
+        gemvCublas(thrust::raw_pointer_cast(d_a.data()),
+                   thrust::raw_pointer_cast(d_x.data()),
+                   thrust::raw_pointer_cast(d_y.data()),
+                   m,
+                   n,
+                   alpha,
+                   beta,
+                   handle);
+
+        golden_y = d_y;
+
+        // GEVM
+        d_y = h_y;
+
+        constexpr int kBlockDimX = 256;
+        using T = float;
+        using Vec = float4;
+        constexpr int kThreadsPerValue = n * sizeof(T) / sizeof(Vec);
+        static_assert(kBlockDimX % kThreadsPerValue == 0);
+        const int smemBytes = (1 + kBlockDimX / kThreadsPerValue) * n * sizeof(T);
+
+        gevm<kBlockDimX, kThreadsPerValue, Vec><<<1, kBlockDimX, smemBytes>>>(
+                thrust::raw_pointer_cast(d_x.data()),
+                thrust::raw_pointer_cast(d_a.data()),
+                thrust::raw_pointer_cast(d_y.data()),
+                m,
+                n
+        );
+
+        CUDA_CHECK_LAST_ERROR();
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::printf("FP32 GEVM ");
+        checkResult(d_y, golden_y, n);
     }
-    std::cout << '\n';
+
+    if constexpr (kTestGevmFp16)
+    {
+        // GEVM
+        thrust::device_vector<half> d_x(1 * m, static_cast<half>(1));
+        thrust::device_vector<half> d_a(m * n, static_cast<half>(1));
+        thrust::device_vector<half> d_y(1 * n, static_cast<half>(0));
+
+        constexpr int kBlockDimX = 256;
+        using T = half;
+        using Vec = half8;
+        constexpr int kThreadsPerValue = n * sizeof(T) / sizeof(Vec);
+        static_assert(kBlockDimX % kThreadsPerValue == 0);
+        const int smemBytes = (1 + kBlockDimX / kThreadsPerValue) * n * sizeof(T);
+
+        gevm<kBlockDimX, kThreadsPerValue, Vec><<<1, kBlockDimX, smemBytes>>>(
+                thrust::raw_pointer_cast(d_x.data()),
+                thrust::raw_pointer_cast(d_a.data()),
+                thrust::raw_pointer_cast(d_y.data()),
+                m,
+                n
+        );
+
+        CUDA_CHECK_LAST_ERROR();
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        thrust::host_vector<half> h_x = d_x;
+
+        for (int i = 0; i < n; ++i)
+        {
+            std::printf("%6.2f ", static_cast<float>(h_x[i]));
+        }
+
+        std::printf("\n");
+    }
 
     // Free cuda resources.
     CUDA_CHECK(cudaEventDestroy(ss));
@@ -469,4 +669,10 @@ int main(int argc, char * argv[])
 /*
 # Profile bank conflicts:
 ncu -k regex:gemmSmem --metrics l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum ./cmake-build-release/demo
+*/
+
+
+/*
+Compute sanitizer to check memory access:
+compute-sanitizer --tool memcheck ./cmake-build-debug/demo
 */
