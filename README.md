@@ -45,7 +45,7 @@ More details are available in `src/utils/`.
   - Block scan routine with warp shuffle intrinsics. 
   - Supports thread-level unrollment (each thread could handle multiple elements).
 - SGEMM: `src/utils/89_gemm`
-  - Reaches 90% performance (avg over 100 times) of cuBLAS on 4096x4096x4096 FP32 SGEMM
+  - Reaches 90% performance (avg over 100 times) of cuBLAS on 4096x4096x4096 FP32 GEMM
   - Naive GEMM
   - Naive tiled SMEM (with bank conflicts) with vectorized loads and stores
     - Bank conflicts take place at stores and loads. 
