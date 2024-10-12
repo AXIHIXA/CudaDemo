@@ -38,6 +38,8 @@ struct UniformDistribution
 template <>
 struct UniformDistribution<float>
 {
+    UniformDistribution() = default;
+
     __device__ float4 operator()(curandStatePhilox4_32_10_t * state)
     {
         return curand_uniform4(state);
@@ -116,12 +118,13 @@ __global__ void dropout(int nx,
     curandStatePhilox4_32_10_t state;
     curand_init(seed, blockOffset + tid, increment, &state);
 
-    auto rand4 = UniformDistribution<float>();
-    auto dstFunctor = DstMaskFunctor<float>(dropoutProb, isScale);
+    UniformDistribution<float> rand4 = {};
+    DstMaskFunctor<float> applyDropout(dropoutProb, isScale);
 
-    // 0 ~ VecSize -1 : dst;VecSize ~ 2 * VecSize - 1: mask
+    // 0        ~ VecSize - 1     : dst
+    // VecSize  ~ 2 * VecSize - 1 : mask
     float regDstMask[kVecSize * 2];
-    float rands[kVecSize];
+    float regRands[kVecSize];
     uint8_t regMask[kVecSize];
 
     using fvec4_t = float4;
@@ -142,11 +145,11 @@ __global__ void dropout(int nx,
         for (int i = 0; i < kVecSize; ++i)
         {
             regDstMask[i] = *(reinterpret_cast<float *>(&temp) + i);
-            rands[i] = static_cast<float>((&r4.x)[i]);
+            regRands[i] = static_cast<float>((&r4.x)[i]);
         }
 
         // Computation
-        dstFunctor(&regDstMask[0], &rands[0], &regDstMask[0]);
+        applyDropout(&regDstMask[0], &regRands[0], &regDstMask[0]);
 
         // Write-back
         reinterpret_cast<fvec4_t *>(dst + start)[threadOffset] = *(reinterpret_cast<fvec4_t *>(&regDstMask[0]));
@@ -167,21 +170,20 @@ __global__ void dropout(int nx,
     {
         // Load
         int threadOffset = tid * kVecSize;
-        const float * src_remain = src + start;
         auto r4 = rand4(&state);
 
         for (int i = 0; i < kVecSize; i++)
         {
             if (i + threadOffset < remain)
             {
-                regDstMask[i] = src_remain[threadOffset + i];
+                regDstMask[i] = src[start + threadOffset + i];
             }
 
-            rands[i] = static_cast<float>((&r4.x)[i]);
+            regRands[i] = static_cast<float>((&r4.x)[i]);
         }
 
         // Computation
-        dstFunctor(&regDstMask[0], &rands[0], &regDstMask[0]);
+        applyDropout(&regDstMask[0], &regRands[0], &regDstMask[0]);
 
         // Write-back
         for (int i = 0; i < kVecSize; ++i)
@@ -189,6 +191,7 @@ __global__ void dropout(int nx,
             if ((threadOffset + i) < remain)
             {
                 dst[start + threadOffset + i] = regDstMask[i];
+
                 regMask[i] = static_cast<uint8_t>(regDstMask[i + kVecSize]);
                 mask[start + threadOffset + i] = regMask[i];
             }
