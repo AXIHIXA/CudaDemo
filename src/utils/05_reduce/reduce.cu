@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <numeric>
+#include <random>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -270,21 +271,20 @@ __global__ void reduceFullUnroll(const T * __restrict__ in, T * __restrict__ out
 // Use grid translation (adapt to input size) instead of block translation (of compile-time constant steps).
 // Adapts to input size automatically, at a cost of degraded performance.
 // Trade-off.
-template <int kBlockDimX, typename T>
+template <int kBlockDimX, typename T, int kWarpThreads = 32>
 __global__ void reduceGridTranslationFullUnroll(const T * __restrict__ src, int nx, T * __restrict__ dst)
 {
-    constexpr int kWarpThreads = 32;
-    static_assert((kBlockDimX & (kBlockDimX - 1)) == 0 && kBlockDimX % kWarpThreads == 0);
+    static_assert(kWarpThreads == 32 && kBlockDimX % kWarpThreads == 0);
+
+    const int tid = threadIdx.x;
+    const int bbx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
 
     __shared__ T smem[kBlockDimX];
 
-    const int tid = threadIdx.x;
-    const int baseX = blockIdx.x * kBlockDimX + threadIdx.x;
-    const int gridStride = gridDim.x * kBlockDimX;
-
     smem[tid] = 0;
 
-    for (int gx = baseX; gx < nx; gx += gridStride)
+    for (int gx = bbx; gx < nx; gx += stride)
     {
         smem[tid] += src[gx];
     }
@@ -409,9 +409,13 @@ __global__ void reduceGridTranslationWarpShuffle(const T * __restrict__ in, int 
 
 void checkResult(const thrust::device_vector<float> & in, const thrust::host_vector<float> & out)
 {
+    constexpr float kRTol = 2e-4f;
+    constexpr float kATol = 1e-4f;
+
     float res = thrust::reduce(out.cbegin(), out.cend());
     float gt = thrust::reduce(thrust::device, in.cbegin(), in.cend());
-    std::printf("Result: %f vs %f, is %s\n\n", res, gt, res == gt ? "correct." : "WRONG!!!");
+    bool allclose = std::abs(res - gt) <= kATol + kRTol * std::abs(gt);
+    std::printf("Result: %f vs %f, is %s\n\n", res, gt, allclose ? "correct." : "WRONG!!!");
 }
 
 
@@ -419,9 +423,16 @@ int main(int argc, char * argv[])
 {
     constexpr int n = 25'600'000;
     thrust::host_vector<float> h_in(n, 1.0f);
+    thrust::host_vector<float> h_out;
+
+    unsigned seed = std::random_device()();
+    std::default_random_engine e(seed);
+    std::uniform_real_distribution<float> d(1, 1);  // Setting to (1, 2) exceeds float precision!
+    auto g = [&d, &e]() { return d(e); };
+    std::generate(h_in.begin(), h_in.end(), g);
+
     thrust::device_vector<float> d_in = h_in;
     thrust::device_vector<float> d_out(n, 0.0f);
-    thrust::host_vector<float> h_out;
 
     #ifdef NDEBUG
     constexpr int kDup = 100;
@@ -429,7 +440,7 @@ int main(int argc, char * argv[])
     constexpr int kDup = 1;
     #endif  // NDEBUG
 
-    constexpr dim3 block = {256};
+    constexpr dim3 block(256);
     dim3 grid = {(n + block.x - 1) / block.x};
 
     float ms;

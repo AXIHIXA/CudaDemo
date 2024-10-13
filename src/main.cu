@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -9,13 +8,74 @@
 #include <vector>
 
 #include <cuda_runtime.h>
-#include <curand_kernel.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
 #include "utils/cuda_utils.h"
 
 
+/// Softmax on innermost dimension.
+void cpuSoftmax(const float * __restrict__ in, float * __restrict__ out, int nx, int ny)
+{
+    for (int y = 0; y < ny; ++y)
+    {
+        float rowSum = 0.0f;
+        float rowMax = std::numeric_limits<float>::min();
+
+        for (int x = 0; x < nx; ++x)
+        {
+            rowMax = std::max(in[y * nx + x], rowMax);
+        }
+
+        for (int x = 0; x < nx; ++x)
+        {
+            rowSum += std::exp(in[y * nx + x] - rowMax);
+        }
+
+        for (int x = 0; x < nx; ++x)
+        {
+            out[y * nx + x] = std::exp(in[y * nx + x] - rowMax) / rowSum;
+        }
+    }
+}
+
+
+template <typename T>
+struct Max
+{
+    __device__ __forceinline__ constexpr bool operator()(const T & a, const T & b)
+    {
+        return (a < b) ? b : a;
+    }
+};
+
+
+template <typename T>
+struct Sum
+{
+    __device__ __forceinline__ T operator()(const T & a, const T & b)
+    {
+        return a + b;
+    }
+};
+
+
+/// Bufferfly warp reduction.
+/// See https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#reduction-across-a-warp
+template <template <typename> class ReductionOp, typename T, int kWarpThreads = 32>
+__inline__ __device__ T warpReduce(T val)
+{
+    #pragma unroll
+    for (int mask = kWarpThreads >> 1; 0 < mask; mask >>= 1)
+    {
+        val = ReductionOp<T>()(val, __shfl_xor_sync(0xffffffff, val, mask, kWarpThreads));
+    }
+
+    return val;
+}
+
+
+// Used for vectorized stores and loads.
 template <typename T, int kSize>
 struct alignas(sizeof(T) * kSize) Vec
 {
@@ -23,237 +83,349 @@ struct alignas(sizeof(T) * kSize) Vec
 };
 
 
-template <typename T>
-struct UniformDistribution
+template <int kPackSize>
+__device__ void vecLdSt(const float * src, float * dst)
 {
-    __device__ T operator()(curandStatePhilox4_32_10_t * state)
+    using Vec = Vec<float, kPackSize>;
+    *reinterpret_cast<Vec *>(dst) = *(reinterpret_cast<const Vec *>(src));
+}
+
+
+/// Each warp handles a consecutive of kThreadSpanY rows in src.
+/// Each row in thread block constitutes a warp.
+/// Grid is 1D, spans in y direction.
+template <int kBlockDimX = 32, int kBlockDimY, int kThreadSpanX, int kThreadSpanY, int kPackSize, int kWarpThreads = 32>
+__global__ void softmax(const float * __restrict__ src,
+                        float * __restrict__ dst,
+                        int nx,
+                        int ny)
+{
+    // Alignment requirements for vectorized loads/stores.
+    // Each warp must be long enough to cover a row.
+    // Grid must be 1D and span by the y dimension.
+    if (kThreadSpanX * kWarpThreads < nx || nx % kPackSize != 0 || gridDim.x != 1 || gridDim.z != 1)
     {
-        return static_cast<T>(curand_uniform(state));
+        __trap();
     }
 
-    static constexpr int kCount = 1;
-};
+    // Each warp handles a complete row of input.
+    // Each warp must consist of a complete row of threads in the thread block.
+    static_assert(kWarpThreads == 32 && kBlockDimX == kWarpThreads);
 
+    // Number of packs (vectorized load granularity on x dimension) should be integer.
+    static_assert(kThreadSpanX % kPackSize == 0);
 
-template <>
-struct UniformDistribution<float>
-{
-    UniformDistribution() = default;
+    constexpr float kMinusInfinity = -10000000000.0f;
+    constexpr int kNumPacks = kThreadSpanX / kPackSize;
 
-    __device__ float4 operator()(curandStatePhilox4_32_10_t * state)
+    const int tid = threadIdx.y * kBlockDimX + threadIdx.x;
+    const int laneIdx = tid % kWarpThreads;
+    const int globalWarpIdx = blockIdx.y * kBlockDimY + threadIdx.y;
+
+    // Register.
+    float buf[kThreadSpanY][kThreadSpanX];
+
+    // Grid translation.
+    for (int baseY = globalWarpIdx * kThreadSpanY; baseY < ny; baseY += gridDim.y * kBlockDimY * kThreadSpanY)
     {
-        return curand_uniform4(state);
-    }
+        float threadMax[kThreadSpanY];
 
-    static constexpr int kCount = 4;
-};
+        // Rows handled by a warp.
+        // Load into register and reduce thread max.
+        #pragma unroll
+        for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
+        {
+            const int gy = baseY + rowIdx;
 
+            if (gy < ny)
+            {
+                float * rowBuf = buf[rowIdx];
+                threadMax[rowIdx] = kMinusInfinity;
 
-template <typename T>
-struct Dropout
-{
-    __device__ Dropout(const float dropoutProb,
-                       const bool isScale) :
-            prob(dropoutProb),
-            isScale(isScale),
-            invProb(1.0f / (1.0f - dropoutProb))
-    {
+                // Vectorized load packs in this warp (row), by this thread.
+                // Each threads loads kThreadSpanX elements into its rowBuf (GMEM -> REG).
+                // Loads are done by kNumPacks vectorized packs, each pack of length kPackSize.
+                // Packs by the same threads are strided, so that warp GMEM loads are coalesced.
+                #pragma unroll
+                for (int packIdx = 0; packIdx < kNumPacks; ++packIdx)
+                {
+                    // p0 p0 p0  p1 p1 p1  p2 p2 p2
+                    const int gx = packIdx * kPackSize * kWarpThreads + laneIdx * kPackSize;
+                    const int packOffset = packIdx * kPackSize;
 
-    }
+                    if (gx < nx)
+                    {
+                        vecLdSt<kPackSize>(src + gy * nx + gx, rowBuf + packOffset);
 
-    __device__ void operator()(const T * __restrict__ src,
-                               const T * __restrict__ rand,
-                               T * __restrict__ dst)
-    {
-        static constexpr int kCount = UniformDistribution<T>::kCount;
+                        #pragma unroll
+                        for (int pi = 0; pi < kPackSize; ++pi)
+                        {
+                            threadMax[rowIdx] = max(threadMax[rowIdx], rowBuf[packOffset + pi]);
+                        }
+                    }
+                    else
+                    {
+                        #pragma unroll
+                        for (int pi = 0; pi < kPackSize; ++pi)
+                        {
+                            rowBuf[packOffset + pi] = kMinusInfinity;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reduce per-warp row max.
+        float rowMax[kThreadSpanY];
 
         #pragma unroll
-        for (int i = 0; i < kCount; ++i)
+        for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
-            if (rand[i] < prob)
-            {
-                const auto zero = static_cast<T>(0);
-                dst[i] = zero;
-                dst[i + kCount] = zero;
-            }
-            else
-            {
-                dst[i] = isScale ? static_cast<T>(src[i] * invProb) : static_cast<T>(src[i]);
-                dst[i + kCount] = static_cast<T>(1);
-            }
+            rowMax[rowIdx] = warpReduce<Max, float>(threadMax[rowIdx]);
         }
-    }
 
-    const float prob;
-    const bool isScale;
-    float invProb;
-};
-
-
-__global__ void dropoutKernel(int nx,
-                              int seed,
-                              const float dropoutProb,
-                              const float * __restrict__ src,
-                              uint8_t * __restrict__ mask,
-                              float * __restrict__ dst,
-                              bool isScale,
-                              int increment,
-                              int mainOffset)
-{
-    const int tid = threadIdx.x;
-    const int threads = blockDim.x;
-    const int bid = blockIdx.x;
-    const int blocks = gridDim.x;
-
-    const int blockOffset = bid * threads;
-    constexpr int kVecSize = UniformDistribution<float>::kCount;
-
-    // Stride for grid translation, i.e., total number of data handled by the whole grid at one step.
-    const int stride = blocks * threads * kVecSize;
-
-    // Initialize cuRAND state.
-    // These states are used only once, so they are NOT stored back to GMEM.
-    // See "3.5 Performance Notes" available at
-    // https://docs.nvidia.com/cuda/curand/device-api-overview.html#performance-notes
-    curandStatePhilox4_32_10_t state;
-    curand_init(seed, blockOffset + tid, increment, &state);
-
-    UniformDistribution<float> rand4 = {};
-    Dropout<float> dropout(dropoutProb, isScale);
-
-    // 0        ~ VecSize - 1     : dst
-    // VecSize  ~ 2 * VecSize - 1 : mask
-    float regDstMask[kVecSize * 2];
-    float regRands[kVecSize];
-    uint8_t regMask[kVecSize];
-
-    using fvec4_t = float4;
-    using uvec8_t = Vec<uint8_t, kVecSize>;
-    fvec4_t temp;
-
-    // Vectorized loads.
-    int start = blockOffset * kVecSize;
-
-    for (; start < mainOffset; start += stride)
-    {
-        // Load
-        int threadOffset = tid;
-        temp = reinterpret_cast<const fvec4_t *>(src + start)[threadOffset];
-        auto r4 = rand4(&state);
+        // In-place exp(x - rowmax), accumulate thread sum.
+        float threadSum[kThreadSpanY];
 
         #pragma unroll
-        for (int i = 0; i < kVecSize; ++i)
+        for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
-            regDstMask[i] = *(reinterpret_cast<float *>(&temp) + i);
-            regRands[i] = static_cast<float>((&r4.x)[i]);
+            float * rowBuf = buf[rowIdx];
+            threadSum[rowIdx] = 0;
+
+            #pragma unroll
+            for (int xi = 0; xi < kThreadSpanX; ++xi)
+            {
+                rowBuf[xi] = exp(rowBuf[xi] - rowMax[rowIdx]);
+                threadSum[rowIdx] += rowBuf[xi];
+            }
         }
 
-        // Computation
-        dropout(&regDstMask[0], &regRands[0], &regDstMask[0]);
-
-        // Write-back
-        reinterpret_cast<fvec4_t *>(dst + start)[threadOffset] = *(reinterpret_cast<fvec4_t *>(&regDstMask[0]));
+        // Reduce per-warp row sum.
+        float rowSum[kThreadSpanY];
 
         #pragma unroll
-        for (int i = 0; i < kVecSize; i++)
+        for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
-            regMask[i] = static_cast<uint8_t>(regDstMask[i + kVecSize]);
+            rowSum[rowIdx] = warpReduce<Sum, float>(threadSum[rowIdx]);
         }
 
-        reinterpret_cast<uvec8_t *>(mask + start)[threadOffset] = *(reinterpret_cast<uvec8_t *>(regMask));
-    }
-
-    // Remainder of vectorized loads/stores, use scalar loads/stores.
-    int remain = nx - start;
-
-    if (0 < remain)
-    {
-        // Load
-        int threadOffset = tid * kVecSize;
-        auto r4 = rand4(&state);
-
-        for (int i = 0; i < kVecSize; i++)
+        // In-place softmax division by rowSum and write-back.
+        #pragma unroll
+        for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
-            if (i + threadOffset < remain)
+            const int gy = baseY + rowIdx;
+
+            if (gy < ny)
             {
-                regDstMask[i] = src[start + threadOffset + i];
-            }
+                float * rowBuf = buf[rowIdx];
 
-            regRands[i] = static_cast<float>((&r4.x)[i]);
-        }
+                #pragma unroll
+                for (int xi = 0; xi < kThreadSpanX; ++xi)
+                {
+                    rowBuf[xi] /= rowSum[rowIdx];
+                }
 
-        // Computation
-        dropout(&regDstMask[0], &regRands[0], &regDstMask[0]);
+                #pragma unroll
+                for (int packIdx = 0; packIdx < kNumPacks; ++packIdx)
+                {
+                    // p0 p0 p0  p1 p1 p1  p2 p2 p2
+                    const int gx = packIdx * kPackSize * kWarpThreads + laneIdx * kPackSize;
+                    const int packOffset = packIdx * kPackSize;
 
-        // Write-back
-        for (int i = 0; i < kVecSize; ++i)
-        {
-            if ((threadOffset + i) < remain)
-            {
-                dst[start + threadOffset + i] = regDstMask[i];
-
-                regMask[i] = static_cast<uint8_t>(regDstMask[i + kVecSize]);
-                mask[start + threadOffset + i] = regMask[i];
+                    if (gx < nx)
+                    {
+                        vecLdSt<kPackSize>(rowBuf + packOffset, dst + gy * nx + gx);
+                    }
+                }
             }
         }
     }
 }
 
 
+template <typename T>
+struct Equal
+{
+    __host__ __device__
+    inline bool operator()(const T & a, const T & b) = delete;
+};
+
+
+template <>
+struct Equal<float>
+{
+    __host__ __device__
+    inline bool operator()(float a, float b)
+    {
+        return abs(a - b) < kAbsTol + kRelTol * abs(b);
+    }
+
+    static constexpr float kAbsTol = 1e-4f;
+    static constexpr float kRelTol = 1e-4f;
+};
+
+
+template <bool kDebugOutput = true>
+void checkResult(const float * __restrict__ res,
+                 const float * __restrict__ gt,
+                 int nx,
+                 int ny)
+{
+    static Equal<float> equal;
+
+    bool correct = true;
+
+    for (int i = 0; i < nx * ny; ++i)
+    {
+        if (!equal(res[i], gt[i]))
+        {
+            correct = false;
+            break;
+        }
+    }
+
+    printf("result is %s\n", correct ? "correct." : "WRONG!!!");
+
+    if constexpr (kDebugOutput)
+    {
+        if (correct)
+        {
+            return;
+        }
+
+        printf("res:\n");
+
+        for (int y = 0; y < 2; ++y)
+        {
+            for (int x = 0; x < nx; ++x)
+            {
+                printf("%11.6f ", res[y * nx + x]);
+            }
+
+            printf("\n");
+        }
+
+        printf("\n\ngt :\n");
+
+        for (int y = 0; y < 2; ++y)
+        {
+            for (int x = 0; x < nx; ++x)
+            {
+                printf("%11.6f ", gt[y * nx + x]);
+            }
+            printf("\n");
+        }
+
+        printf("\n");
+    }
+}
+
+
 int main(int argc, char * argv[])
 {
-    constexpr bool kTestDropout = true;
+    /// Switches for debugging output correctness.
+    /// \param kDup        Set to 1 to debug output (kernel only launched once) and results will be checked.
+    ///                    Set to values greater than 1 to profile.
+    ///                    In the latter case, results will NOT be checked because it's in-place GEMM.
+    ///                    We do not dispatch by build type because we have -G flag for Debug builds
+    ///                    (that's for debugging runtime errors).
+    /// \param kRandInput  Whether we random input.
+    ///                    Enable when checking correctness or profiling.
+    ///                    Disable when debugging output.
+    constexpr int kDup = 1;
+    constexpr bool kRandInput = true;
 
-    const int nx = 2050;
-    thrust::host_vector<float> hostX(nx, 1);
-    thrust::host_vector<float> hostY;
-    thrust::host_vector<uint8_t> hostMask;
+    constexpr bool kTestSoftmax = true;
 
-    thrust::device_vector<float> devX = hostX;
-    thrust::device_vector<float> devY(nx);
-    thrust::device_vector<uint8_t> devMask(nx);
+    int nx = 1024;
+    int ny = 1000;
+    thrust::host_vector<float> hostSrc(ny * nx, 1.0f);
+    thrust::host_vector<float> hostDst;
 
-    const bool isScale = true;
-    const float dropoutProb = 0.5f;
-    const auto seed = static_cast<int>(std::random_device()());
-    printf("seed = %u\n", seed);
-
-    if constexpr (kTestDropout)
+    if constexpr (kRandInput)
     {
-        constexpr int kRandVecSize = UniformDistribution<float>::kCount;
+        unsigned seed = std::random_device()();
+        std::default_random_engine e(seed);
+        std::normal_distribution<float> d(4.0f, 1.0f);
+        // std::uniform_int_distribution<int> d(1, 10);
+        auto g = [&e, &d]() -> float { return d(e); };
+        std::generate(hostSrc.begin(), hostSrc.end(), g);
+    }
 
-        dim3 grid(2);
-        dim3 block(256);
+    thrust::host_vector<float> gt(ny * nx, 1.0f);
+    cpuSoftmax(hostSrc.data(), gt.data(), nx, ny);
 
-        // Amount of data that could be loaded/stored vectorized.
-        // The remainder are processed as scalar values sequentially.
-        // Only applies to 1D data layout.
-        const int mainOffset = nx / (grid.x * block.x * kRandVecSize) * (grid.x * block.x * kRandVecSize);
+    thrust::device_vector<float> devSrc = hostSrc;
+    thrust::device_vector<float> devDst(ny * nx);
 
-        dropoutKernel<<<grid, block>>>(
-                nx,
-                seed,
-                dropoutProb,
-                thrust::raw_pointer_cast(devX.data()),
-                thrust::raw_pointer_cast(devMask.data()),
-                thrust::raw_pointer_cast(devY.data()),
-                isScale,
-                0,
-                mainOffset
-        );
+    // CUDA resources that require manual destruction.
+    float ms;
+    cudaEvent_t ss, ee;
+    CUDA_CHECK(cudaEventCreate(&ss));
+    CUDA_CHECK(cudaEventCreate(&ee));
+
+    constexpr int kPackSize = 4;
+    constexpr int kWarpThreads = 32;
+
+    constexpr dim3 kBlock(32, 8);
+    constexpr int kThreadSpanX = 32;
+    constexpr int kThreadSpanY = 1;
+    constexpr int kBlockSpanX = kThreadSpanX * kBlock.x;
+    constexpr int kBlockSpanY = kThreadSpanY * kBlock.y;
+
+    dim3 grid((nx + kBlockSpanX - 1) / kBlockSpanX, (ny + kBlockSpanY - 1) / kBlockSpanY);
+
+    // Test
+    if constexpr (kTestSoftmax)
+    {
+        if constexpr (1 < kDup)
+        {
+            softmax<kBlock.x, kBlock.y, kThreadSpanX, kThreadSpanY, kPackSize, kWarpThreads><<<grid, kBlock>>>(
+                    thrust::raw_pointer_cast(devSrc.data()),
+                    thrust::raw_pointer_cast(devDst.data()),
+                    nx,
+                    ny
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        CUDA_CHECK(cudaEventRecord(ss));
+
+        for (int dup = 0; dup < kDup; ++dup)
+        {
+            softmax<kBlock.x, kBlock.y, kThreadSpanX, kThreadSpanY, kPackSize, kWarpThreads><<<grid, kBlock>>>(
+                    thrust::raw_pointer_cast(devSrc.data()),
+                    thrust::raw_pointer_cast(devDst.data()),
+                    nx,
+                    ny
+            );
+        }
 
         CUDA_CHECK_LAST_ERROR();
         CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaEventRecord(ee));
+        CUDA_CHECK(cudaEventSynchronize(ee));
 
-        hostY = devY;
-        hostMask = devMask;
+        hostDst = devDst;
 
-        for (int i = nx - 3; i < nx; ++i)
+        std::printf("softmax: ");
+        CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
+        std::printf("took %f ms, ", ms / kDup);
+
+        if constexpr (1 == kDup)
         {
-            std::printf("[%d] y = %f\n", i, hostY[i]);
-            std::printf("[%d] mask = %d\n", i, static_cast<int>(hostMask[i]));
+            checkResult(hostDst.data(), gt.data(), nx, ny);
+        }
+        else
+        {
+            std::printf("\n");
         }
     }
+
+    // Free cuda resources.
+    CUDA_CHECK(cudaEventDestroy(ss));
+    CUDA_CHECK(cudaEventDestroy(ee));
 
     return EXIT_SUCCESS;
 }
@@ -279,10 +451,4 @@ int main(int argc, char * argv[])
 /*
 # Profile bank conflicts:
 ncu -k regex:gemmSmem --metrics l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum ./cmake-build-release/demo
-*/
-
-
-/*
-Compute sanitizer to check memory access:
-compute-sanitizer --tool memcheck ./cmake-build-debug/demo
 */

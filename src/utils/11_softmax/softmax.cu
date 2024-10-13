@@ -91,38 +91,47 @@ __device__ void vecLdSt(const float * src, float * dst)
 }
 
 
-template <int kBlockDimX, int kBlockDimY, int kBlockSpanX, int kBlockSpanY, int kPackSize, int kWarpThreads = 32>
+/// Each warp handles a consecutive of kThreadSpanY rows in src.
+/// Each row in thread block constitutes a warp.
+/// Grid is 1D, spans in y direction.
+template <int kBlockDimX = 32, int kBlockDimY, int kThreadSpanX, int kThreadSpanY, int kPackSize, int kWarpThreads = 32>
 __global__ void softmax(const float * __restrict__ src,
                         float * __restrict__ dst,
                         int nx,
                         int ny)
 {
-    constexpr float kMinusInfinity = -10000000000.0f;
+    // Alignment requirements for vectorized loads/stores.
+    // Each warp must be long enough to cover a row.
+    // Grid must be 1D and span by the y dimension.
+    if (kThreadSpanX * kWarpThreads < nx || nx % kPackSize != 0 || gridDim.x != 1 || gridDim.z != 1)
+    {
+        __trap();
+    }
 
-    constexpr int kThreadSpanX = kBlockSpanX / kBlockDimX;
-    constexpr int kThreadSpanY = kBlockSpanY / kBlockDimY;
-    constexpr int kNumPacks = kThreadSpanX / kPackSize;
-
-    // Each warp handles a complete line of input.
-    assert(nx <= kThreadSpanX * kWarpThreads);
-    static_assert(kBlockDimX == kWarpThreads && kWarpThreads == 32);
+    // Each warp handles a complete row of input.
+    // Each warp must consist of a complete row of threads in the thread block.
+    static_assert(kWarpThreads == 32 && kBlockDimX == kWarpThreads);
 
     // Number of packs (vectorized load granularity on x dimension) should be integer.
     static_assert(kThreadSpanX % kPackSize == 0);
 
-    const int tid = threadIdx.y * kBlockDimX + threadIdx.x;
-    const int globalWarpIdx = blockIdx.y * blockDim.y + threadIdx.y;
-    const int numGlobalWarps = gridDim.y * blockDim.y;
-    const int laneIdx = tid % kWarpThreads;
+    constexpr float kMinusInfinity = -10000000000.0f;
+    constexpr int kNumPacks = kThreadSpanX / kPackSize;
 
+    const int tid = threadIdx.y * kBlockDimX + threadIdx.x;
+    const int laneIdx = tid % kWarpThreads;
+    const int globalWarpIdx = blockIdx.y * kBlockDimY + threadIdx.y;
+
+    // Register.
     float buf[kThreadSpanY][kThreadSpanX];
 
     // Grid translation.
-    for (int baseY = globalWarpIdx * kThreadSpanY; baseY < ny; baseY += numGlobalWarps * kThreadSpanY)
+    for (int baseY = globalWarpIdx * kThreadSpanY; baseY < ny; baseY += gridDim.y * kBlockDimY * kThreadSpanY)
     {
         float threadMax[kThreadSpanY];
 
         // Rows handled by a warp.
+        // Load into register and reduce thread max.
         #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
@@ -140,6 +149,7 @@ __global__ void softmax(const float * __restrict__ src,
                 #pragma unroll
                 for (int packIdx = 0; packIdx < kNumPacks; ++packIdx)
                 {
+                    // p0 p0 p0  p1 p1 p1  p2 p2 p2
                     const int gx = packIdx * kPackSize * kWarpThreads + laneIdx * kPackSize;
                     const int packOffset = packIdx * kPackSize;
 
@@ -165,7 +175,7 @@ __global__ void softmax(const float * __restrict__ src,
             }
         }
 
-        // Warp max aka row max.
+        // Reduce per-warp row max.
         float rowMax[kThreadSpanY];
 
         #pragma unroll
@@ -174,9 +184,7 @@ __global__ void softmax(const float * __restrict__ src,
             rowMax[rowIdx] = warpReduce<Max, float>(threadMax[rowIdx]);
         }
 
-        // Thread sum and in-place exp.
-        // Thread sum needs to be calculated after row max is reduced.
-        // Modify in-place of registers from xi to exp(xi - xMax).
+        // In-place exp(x - rowmax), accumulate thread sum.
         float threadSum[kThreadSpanY];
 
         #pragma unroll
@@ -193,7 +201,7 @@ __global__ void softmax(const float * __restrict__ src,
             }
         }
 
-        // Row sum aka warp sum.
+        // Reduce per-warp row sum.
         float rowSum[kThreadSpanY];
 
         #pragma unroll
@@ -202,7 +210,7 @@ __global__ void softmax(const float * __restrict__ src,
             rowSum[rowIdx] = warpReduce<Sum, float>(threadSum[rowIdx]);
         }
 
-        // Softmax division and writeback.
+        // In-place softmax division by rowSum and write-back.
         #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
@@ -221,6 +229,7 @@ __global__ void softmax(const float * __restrict__ src,
                 #pragma unroll
                 for (int packIdx = 0; packIdx < kNumPacks; ++packIdx)
                 {
+                    // p0 p0 p0  p1 p1 p1  p2 p2 p2
                     const int gx = packIdx * kPackSize * kWarpThreads + laneIdx * kPackSize;
                     const int packOffset = packIdx * kPackSize;
 
@@ -249,10 +258,11 @@ struct Equal<float>
     __host__ __device__
     inline bool operator()(float a, float b)
     {
-        return abs(a - b) < kEps;
+        return abs(a - b) < kAbsTol + kRelTol * abs(b);
     }
 
-    static constexpr float kEps = 1e-3f;
+    static constexpr float kAbsTol = 1e-4f;
+    static constexpr float kRelTol = 1e-4f;
 };
 
 
@@ -357,9 +367,13 @@ int main(int argc, char * argv[])
 
     constexpr int kPackSize = 4;
     constexpr int kWarpThreads = 32;
+
     constexpr dim3 kBlock(32, 8);
-    constexpr int kBlockSpanX = kBlock.x * 32;
-    constexpr int kBlockSpanY = kBlock.y;
+    constexpr int kThreadSpanX = 32;
+    constexpr int kThreadSpanY = 1;
+    constexpr int kBlockSpanX = kThreadSpanX * kBlock.x;
+    constexpr int kBlockSpanY = kThreadSpanY * kBlock.y;
+
     dim3 grid((nx + kBlockSpanX - 1) / kBlockSpanX, (ny + kBlockSpanY - 1) / kBlockSpanY);
 
     // Test
@@ -367,7 +381,7 @@ int main(int argc, char * argv[])
     {
         if constexpr (1 < kDup)
         {
-            softmax<kBlock.x, kBlock.y, kBlockSpanX, kBlockSpanY, kPackSize, kWarpThreads><<<grid, kBlock>>>(
+            softmax<kBlock.x, kBlock.y, kThreadSpanX, kThreadSpanY, kPackSize, kWarpThreads><<<grid, kBlock>>>(
                     thrust::raw_pointer_cast(devSrc.data()),
                     thrust::raw_pointer_cast(devDst.data()),
                     nx,
@@ -380,7 +394,7 @@ int main(int argc, char * argv[])
 
         for (int dup = 0; dup < kDup; ++dup)
         {
-            softmax<kBlock.x, kBlock.y, kBlockSpanX, kBlockSpanY, kPackSize, kWarpThreads><<<grid, kBlock>>>(
+            softmax<kBlock.x, kBlock.y, kThreadSpanX, kThreadSpanY, kPackSize, kWarpThreads><<<grid, kBlock>>>(
                     thrust::raw_pointer_cast(devSrc.data()),
                     thrust::raw_pointer_cast(devDst.data()),
                     nx,

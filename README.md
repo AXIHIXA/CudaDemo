@@ -9,9 +9,9 @@ More details are available in `src/utils/`.
 - Reduction: `src/utils/05_reduce`
   - Naive GEMM
   - SMEM version
-  - In-block unroll (multiple elements per block)
-  - Full loop unroll
-  - warp shuffle reduction
+  - Multiple elements per thread
+  - Loop unrolling and last-warp unrolled
+  - Warp shuffle reduction
   - Grid-translation to adapt arbitraty sizes
 - Histogram: `src/utils/07_hist`
   - SMEM histogram program with atomic primitives
