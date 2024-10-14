@@ -35,14 +35,16 @@ More details are available in `src/utils/`.
     - Overlaps kernel execution with host-device memory transfer. 
   - Observed performance boost with non-default streams.
 - GEMV: `src/utils/15_gemv`
-  - GEMV kernel for fp32
-  - GEVM kernel for both fp32 and fp16
-  - Uses vectorized loads and SMEM optimization
+  - GEMV kernel for fp32.
+  - GEVM kernel for both fp32 and fp16.
+  - Uses vectorized loads and SMEM optimization.
 - Dropout: `src/utils/16_dropout`
   - Fuse mask generation and scaling into one kernel.
 - Matrix Transpose: `src/utils/80_transpose`
   - Naive GMEM
-  - Padded SMEM Version with no bank conflicts
+  - Padded SMEM Version with no bank conflicts.
+- Im2col: `src/utils/81_im2col`
+  - Im2col kernel for convolution routines.
 - Parallel Scan: `src/utils/82_scan`
   - Block scan routine with warp shuffle intrinsics. 
   - Supports thread-level unrollment (each thread could handle multiple elements).
@@ -50,7 +52,7 @@ More details are available in `src/utils/`.
   - Reaches 90% performance (avg over 100 times) of cuBLAS on 4096x4096x4096 FP32 GEMM
   - Naive GEMM
   - Naive tiled SMEM (with bank conflicts) with vectorized loads and stores
-    - Bank conflicts take place at stores and loads. 
+    - Bank conflicts take place at stores and loads;
       - Each thread block handles 128x128 block;
       - Each thread handles one 8x8 block or 4 strided 4x4 blocks (depending on tiling);
       - Each SMEM chunk contains 8x128 elements. 
