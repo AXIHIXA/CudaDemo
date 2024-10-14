@@ -50,26 +50,43 @@ __global__ void im2colKernel(
     //                                              colWidth)
     for (int gid = blockIdx.x * blockDim.x + threadIdx.x; gid < n; gid += gridDim.x * blockDim.x)
     {
-        const int wOut = gid % colWidth;
+        // colHeight * colWidth
+        // ┏━━┳━━┳━━┳━━┳━━┓
+        // ┣━━╋━━╋━━╋━━╋━━┫
+        // ┣━━╋━━╋━━╋━━╋━━┫  channels * kernelHeight * kernelWidth
+        // ┣━━╋━━╋━━╋━━╋━━┫
+        // ┣━━╋━━╋━━╋━━╋━━┫
+        // ┗━━┻━━┻━━┻━━┻━━┛
 
-        const int idx = gid / colWidth;
+        // Each thread handles a (kernelHeight * kernelWidth, 1) submatrix below:
+        // h, w stands for colHeightIdx and colWidthIdx.
 
-        const int hOut = idx % colHeight;
-        const int cIn = idx / colHeight;
-        const int cOut = cIn * kernelHeight * kernelWidth;
+        // h0w0 h0w1 h0w2 h1w0 h1w1 h1w2 h2w0 h2w1 h2w2   <-- for im channel 0 (kernel idx 0)
+        // h0w0 h0w1 h0w2 h1w0 h1w1 h1w2 h2w0 h2w1 h2w2   <-- for im channel 0 (kernel idx 1)
+        // ............................................       ................
+        // h0w0 h0w1 h0w2 h1w0 h1w1 h1w2 h2w0 h2w1 h2w2   <-- for im channel 0 (kernel idx kernelHeight * kernelWidth - 1)
 
-        const int hIn = hOut * strideHeight - padHeight;
-        const int wIn = wOut * strideWidth - padWidth;
+        // h0w0 h0w1 h0w2 h1w0 h1w1 h1w2 h2w0 h2w1 h2w2   <-- for im channel 1 ...
 
-        T * col = colPtr + (cOut * colHeight + hOut) * colWidth + wOut;
-        const T * im = imPtr + (cIn * height + hIn) * width + wIn;
+        const int colWidthIdx = gid % colWidth;
+        const int colHeightIdx = (gid / colWidth) % colHeight;
+
+        const int imChannelIdx = gid / (colHeight * colWidth);
+        const int colChannelIdx = imChannelIdx * kernelHeight * kernelWidth;
+
+        // Im coordinates of this kernel's top-left corner.
+        const int imBaseHeight = colHeightIdx * strideHeight - padHeight;
+        const int imBaseWidth = colWidthIdx * strideWidth - padWidth;
+
+        T * col = colPtr + (colChannelIdx * colHeight + colHeightIdx) * colWidth + colWidthIdx;
+        const T * im = imPtr + (imChannelIdx * height + imBaseHeight) * width + imBaseWidth;
 
         for (int i = 0; i < kernelHeight; ++i)
         {
             for (int j = 0; j < kernelWidth; ++j)
             {
-                const int h = hIn + i * dilationHeight;
-                const int w = wIn + j * dilationWidth;
+                const int h = imBaseHeight + i * dilationHeight;
+                const int w = imBaseWidth + j * dilationWidth;
 
                 *col = (0 <= h && h < height && 0 <= w && w < width) ?
                        im[i * dilationHeight * width + j * dilationWidth] :
@@ -135,7 +152,7 @@ int main(int argc, char * argv[])
     using T = float;
 
     const int batchSize = 1;
-    const int channels = 3;
+    const int channels = 1;
     const int height = 3;
     const int width = 3;
     const int kernelHeight = 2;
@@ -186,6 +203,19 @@ int main(int argc, char * argv[])
     CUDA_CHECK(cudaDeviceSynchronize());
 
     thrust::host_vector<T> hstCol = devCol;
+
+    printf("im:\n");
+
+    for (int y = 0; y < height * channels; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            printf("%6.2f ", hstIm[y * width + x]);
+        }
+
+        printf("\n");
+    }
+
     printf("col:\n");
 
     for (int y = 0; y < colChannels; ++y)
