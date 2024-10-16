@@ -54,7 +54,7 @@ __global__ void flash_attn_fwd_kernel(
             Vj[(tx * d) + x] = V[qkvOffset + (tileSize * j) + (tx * d) + x];
         }
 
-        __syncthreads();  // such that the inner loop can use the correct Kj, Vj
+        __syncthreads();
 
         for (int i = 0; i < Tr; ++i)
         {
