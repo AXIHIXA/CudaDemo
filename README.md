@@ -48,6 +48,8 @@ More details are available in `src/utils/`.
 - Parallel Scan: `src/utils/82_scan`
   - Block scan routine with warp shuffle intrinsics. 
   - Supports thread-level unrollment (each thread could handle multiple elements).
+- Mini flash attention: `src/utils/83_mini_flash_attention`
+  - Mini flash attention v1 (forward pass) for demo purposes
 - SGEMM: `src/utils/89_gemm`
   - Reaches 90% performance (avg over 100 times) of cuBLAS on 4096x4096x4096 FP32 GEMM
   - Naive GEMM

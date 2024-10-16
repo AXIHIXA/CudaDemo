@@ -6,18 +6,17 @@
 #include "utils/cuda_utils.h"
 
 
-template <typename T>
 __global__ void flash_attn_fwd_kernel(
-        const T * __restrict__ Q,
-        const T * __restrict__ K,
-        const T * __restrict__ V,
+        const float * __restrict__ Q,
+        const float * __restrict__ K,
+        const float * __restrict__ V,
         const int n,
         const int d,
         const int Tc,
         const int Tr,
         const int Bc,
         const int Br,
-        const T softmaxScale,
+        const float softmaxScale,
         float * __restrict__ l,
         float * __restrict__ m,
         float * __restrict__ O)
@@ -94,40 +93,33 @@ __global__ void flash_attn_fwd_kernel(
             }
 
             // Update m and l
-            float newRowMax = max(oldRowMax, rowMax);
-            float newRowSum = (expf(oldRowMax - newRowMax) * oldRowSum) + (expf(rowMax - newRowMax) * rowSum);
+            float row_m_new = max(oldRowMax, rowMax);
+            float row_l_new = (__expf(oldRowMax - row_m_new) * oldRowSum) + (__expf(rowMax - row_m_new) * rowSum);
 
             // Write O, l, m to HBM
-            for (int x = 0; x < d; ++x)
+            for (int x = 0; x < d; x++)
             {
                 float pv = 0;  // Pij * Vj
 
-                for (int y = 0; y < Bc; ++y)
+                for (int y = 0; y < Bc; y++)
                 {
                     pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
                 }
 
-                O[qkvOffset + (tileSize * i) + (tx * d) + x] =
-                        (1 / newRowSum) *
-                        (
-                            (oldRowSum *
-                             expf(oldRowMax - newRowMax) *
-                             O[qkvOffset + (tileSize * i) + (tx * d) + x])
-                            +
-                            (expf(rowMax - newRowMax) * pv)
-                        );
+                O[qkvOffset + (tileSize * i) + (tx * d) + x] = (1 / row_l_new) \
+ * ((oldRowSum * __expf(oldRowMax - row_m_new) * O[qkvOffset + (tileSize * i) + (tx * d) + x]) \
+ + (__expf(rowMax - row_m_new) * pv));
             }
 
-            m[lmOffset + (Br * i) + tx] = newRowMax;
-            l[lmOffset + (Br * i) + tx] = newRowSum;
+            m[lmOffset + (Br * i) + tx] = row_m_new;
+            l[lmOffset + (Br * i) + tx] = row_l_new;
         }
 
-        __syncthreads();
+        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
     }
 }
 
 
-template <typename T>
 torch::Tensor fwd(torch::Tensor & Q,
                   torch::Tensor & K,
                   torch::Tensor & V)
@@ -137,9 +129,8 @@ torch::Tensor fwd(torch::Tensor & Q,
     K = K.contiguous().to(torch::kFloat32).to(device);
     V = V.contiguous().to(torch::kFloat32).to(device);
 
-    constexpr int Bc = 32;
-    constexpr int Br = 32;
-    static_assert(Bc == Br);
+    const int Bc = 32;
+    const int Br = 32;
 
     const int batchSize = Q.size(0);
     const int numHeads = Q.size(1);
@@ -149,19 +140,19 @@ torch::Tensor fwd(torch::Tensor & Q,
     const int Tc = (seqlen + Bc - 1) / Bc;
     const int Tr = (seqlen + Br - 1) / Br;
 
-    const T softmaxScale = 1.0 / std::sqrt(embedDim);
+    const float softmaxScale = 1.0f / std::sqrt(embedDim);
 
     // Initialize O, l, m to HBM
     torch::Tensor O = torch::zeros_like(Q).to(device);
     torch::Tensor l = torch::zeros({batchSize, numHeads, seqlen}).to(torch::kFloat32).to(device);
     torch::Tensor m = torch::full({batchSize, numHeads, seqlen}, -INFINITY).to(torch::kFloat32).to(device);
 
-    // SMEM for Qi, Kj, Vj, and S == Qi @ Vj.T.
+    // SMEM for Qi, Kj, Vj, and S == Qi @ Vj.transpose(-2, -1).
     // Qi: (Br, d,)
     // Kj: (Bc, d,)
     // Vj: (Bc, d,)
     // S: (Br, Bc,)
-    const int smemBytes = ((Br * embedDim) + (2 * Bc * embedDim) + (Br * Bc)) * sizeof(T);
+    const int smemBytes = ((Br * embedDim) + (2 * Bc * embedDim) + (Br * Bc)) * sizeof(float);
 
     // // Note: This returns the max static SMEM size per block.
     // // Per https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications-technical-specifications-per-compute-capability,
@@ -173,7 +164,7 @@ torch::Tensor fwd(torch::Tensor & Q,
     {
         CUDA_CHECK(
                 cudaFuncSetAttribute(
-                        flash_attn_fwd_kernel<T>,
+                        flash_attn_fwd_kernel,
                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                         smemBytes
                 )
@@ -192,13 +183,13 @@ torch::Tensor fwd(torch::Tensor & Q,
         throw std::runtime_error(buf);
     }
 
-    dim3 grid(batchSize, numHeads);  // batch_size x num_heads blocks
-    dim3 block(Bc);  // Bc threads per block
+    dim3 grid(batchSize, numHeads);  // batch_size x num_heads
+    dim3 block(Bc);                  // Bc threads per block
 
     flash_attn_fwd_kernel<<<grid, block, smemBytes>>>(
-            Q.const_data_ptr<T>(),
-            K.const_data_ptr<T>(),
-            V.const_data_ptr<T>(),
+            Q.const_data_ptr<float>(),
+            K.const_data_ptr<float>(),
+            V.const_data_ptr<float>(),
             seqlen,
             embedDim,
             Tc,
@@ -206,9 +197,9 @@ torch::Tensor fwd(torch::Tensor & Q,
             Bc,
             Br,
             softmaxScale,
-            l.mutable_data_ptr<T>(),
-            m.mutable_data_ptr<T>(),
-            O.mutable_data_ptr<T>()
+            l.mutable_data_ptr<float>(),
+            m.mutable_data_ptr<float>(),
+            O.mutable_data_ptr<float>()
     );
 
     CUDA_CHECK_LAST_ERROR();
@@ -220,11 +211,10 @@ torch::Tensor fwd(torch::Tensor & Q,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    using T = float;
     using py::literals::operator""_a;
 
     m.def("fwd",
-          torch::wrap_pybind_function(fwd<T>),
+          torch::wrap_pybind_function(fwd),
           "fwd",
           "Q"_a,
           "K"_a,
