@@ -23,35 +23,6 @@ set(Torch_ROOT_DIR "${Python_ROOT_DIR}/lib/python${Python_VERSION_MAJOR}.${Pytho
 find_package(Torch REQUIRED CONFIG HINTS "${Torch_ROOT_DIR}/share/cmake")
 
 
-set(ALL_INCLUDE_DIRS
-        include
-)
-
-set(ALL_LIBRARIES
-        cudadevrt
-        cudart
-        cublas
-        curand
-        cusparse
-)
-
-set(ALL_COMPILE_DEFS
-
-)
-
-set(CUDA_DEBUG_FLAGS
-        -Xptxas -v  # Check register spills during linking (-X compiler flag will be forwarded to linker)
-        -G  # "-lineinfo" by default under "-G"
-)
-
-set(ALL_COMPILE_OPTS
-        # -g is default in CMAKE_<LANG>_FLAGS_DEBUG
-        $<$<CONFIG:DEBUG>:-O0>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:${CUDA_DEBUG_FLAGS}>
-        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
-        $<$<COMPILE_LANGUAGE:CUDA>:--relocatable-device-code=true>  # For dynamic parallelism
-)
-
 set(DEMO demo)
 add_executable(${DEMO}
         include/utils/cuda_utils.h
@@ -62,9 +33,27 @@ set_target_properties(${DEMO} PROPERTIES
         CUDA_RESOLVE_DEVICE_SYMBOLS ON  # For dynamic parallelism
 )
 target_compile_definitions(${DEMO} PUBLIC ${ALL_COMPILE_DEFS})
-target_compile_options(${DEMO} PUBLIC ${ALL_COMPILE_OPTS})
-target_include_directories(${DEMO} PUBLIC ${ALL_INCLUDE_DIRS})
-target_link_libraries(${DEMO} ${ALL_LIBRARIES})
+target_compile_options(${DEMO} PUBLIC
+        --compiler-options -fPIC
+        --expt-extended-lambda
+        --expt-relaxed-constexpr
+        --use_fast_math
+        -Xptxas -warn-lmem-usage,-warn-spills
+        -lineinfo
+        $<$<CONFIG:DEBUG>:-O0>
+        # -g is default in CMAKE_CXX_FLAGS_DEBUG and CMAKE_CUDA_FLAGS_DEBUG
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:-G>
+)
+target_include_directories(${DEMO} PUBLIC
+        include
+)
+target_link_libraries(${DEMO}
+        cudadevrt
+        cudart
+        cublas
+        curand
+        cusparse
+)
 
 # NOT NEEDED given CMAKE_CUDA_ARCHITECTURE is set properly
 # target_compile_options(${EXECUTABLE} PRIVATE
@@ -114,7 +103,7 @@ target_compile_options(${MINI_FLASH_ATTN} PUBLIC
         --expt-extended-lambda
         --expt-relaxed-constexpr
         --use_fast_math
-        -Xptxas -v
+        -Xptxas -warn-lmem-usage,-warn-spills
         -lineinfo
 )
 target_link_directories(${MINI_FLASH_ATTN} PUBLIC
