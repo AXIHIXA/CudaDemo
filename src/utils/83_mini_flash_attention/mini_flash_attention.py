@@ -63,50 +63,57 @@ def flash_attn_bwd(Q: torch.Tensor,
                    Bc: int,
                    Br: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
+    P = softmax(S)
+    O = P @ V
+
+    D = dO * O
+    dS = P * (dP - D)
     """
-    assert Q.size() == K.size() == V.size() == O.size() == dO.size()
+    assert Q.shape == K.shape == V.shape == O.shape == dO.shape and Q.shape[:-1] == L.shape
     assert Q.device == K.device == V.device == O.device == dO.device == L.device
     n: int = Q.size(0)
     d: int = Q.size(1)
-    assert n % Br == 0 and n % Bc == 0
+    dtype = torch.float32
+    device = V.device
 
-    dQ: torch.Tensor = torch.zeros_like(Q, dtype=torch.float32, device=Q.device)  # (n, d,)
-    dK: torch.Tensor = torch.zeros_like(K, dtype=torch.float32, device=K.device)  # (n, d,)
-    dV: torch.Tensor = torch.zeros_like(V, dtype=torch.float32, device=V.device)  # (n, d,)
+    assert n % Br == 0 and n % Bc == 0
+    Tc: int = n // Bc
+    Tr: int = n // Br
 
     softmax_scale: float = 1.0 / math.sqrt(d)
 
-    Tr: int = n // Br
-    Tc: int = n // Bc
-
     D: torch.Tensor = torch.sum(dO * O, dim=-1)  # (n,)
 
+    dQ: torch.Tensor = torch.zeros_like(Q, dtype=dtype, device=device)  # (n, d,)
+    dK: torch.Tensor = torch.zeros_like(K, dtype=dtype, device=device)  # (n, d,)
+    dV: torch.Tensor = torch.zeros_like(V, dtype=dtype, device=device)  # (n, d,)
+
     for j in range(Tc):
-        Kj = K[j * Bc:(j + 1) * Bc, :]  # (Bc, d,)
-        Vj = V[j * Bc:(j + 1) * Bc, :]  # (Bc, d,)
-        dKj = torch.zeros((Bc, d,), dtype=torch.float32, device=K.device)  # (Bc, d,)
-        dVj = torch.zeros((Bc, d,), dtype=torch.float32, device=K.device)  # (Bc, d,)
+        Kj: torch.Tensor = K[j * Bc:(j + 1) * Bc, :]  # (Bc, d,)
+        Vj: torch.Tensor = V[j * Bc:(j + 1) * Bc, :]  # (Bc, d,)
+        dKj: torch.Tensor = torch.zeros((Bc, d,), dtype=dtype, device=device)  # (Bc, d,)
+        dVj: torch.Tensor = torch.zeros((Bc, d,), dtype=dtype, device=device)  # (Bc, d,)
 
         for i in range(Tr):
-            Qi = Q[i * Br:(i + 1) * Br, :]  # (Br, d,)
-            dOi = dO[i * Br:(i + 1) * Br, :]  # (Br, d,)
+            Qi: torch.Tensor = Q[i * Br:(i + 1) * Br, :] * softmax_scale  # (Br, d,)
+            dOi: torch.Tensor = dO[i * Br:(i + 1) * Br, :]  # (Br, d,)
+            Li: torch.Tensor = L[i * Br:(i + 1) * Br]  # (Br,)
+            Di: torch.Tensor = D[i * Br:(i + 1) * Br]  # (Br,)
 
-            Li = L[i * Br:(i + 1) * Br]  # (Br,)
-            Di = D[i * Br:(i + 1) * Br]  # (Br,)
+            S: torch.Tensor = Qi @ Kj.transpose(-2, -1) # (Br, Bc,)
+            P: torch.Tensor = torch.exp(S - Li.unsqueeze(-1))  # (Br, Bc,)
 
-            S = Qi @ Kj.transpose(-2, -1) * softmax_scale # (Br, Bc,)
-            P = torch.exp(S - Li.unsqueeze(-1))  # (Br, Bc,)
             dVj = dVj + P.transpose(-2, -1) @ dOi  # (Bc, d,)
-            dP = dOi @ Vj.transpose(-2, -1)  # (Br, Bc,)
-            dS = P * (dP - Di.unsqueeze(-1))  # (Br, Bc,)
+            dP: torch.Tensor = dOi @ Vj.transpose(-2, -1)  # (Br, Bc,)
+            dS: torch.Tensor = P * (dP - Di.unsqueeze(-1))  # (Br, Bc,)
 
-            dQi = dQ[i * Br:(i + 1) * Br, :]  # (Br, d,)
+            dQi: torch.Tensor = dQ[i * Br:(i + 1) * Br, :]  # (Br, d,)
             dQi = dQi + dS @ Kj  # (Br, d,)
             dQ[i * Br:(i + 1) * Br, :] = dQi  # (Br, d,)
 
             dKj = dKj + dS.transpose(-2, -1) @ Qi  # (Bc, d,)
 
-        dK[j * Bc:(j + 1) * Bc, :] = dKj * softmax_scale
+        dK[j * Bc:(j + 1) * Bc, :] = dKj
         dV[j * Bc:(j + 1) * Bc, :] = dVj
 
     return dQ, dK, dV
