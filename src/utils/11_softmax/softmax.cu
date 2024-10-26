@@ -137,11 +137,12 @@ __global__ void softmax(const float * __restrict__ src,
         {
             const int gy = baseY + rowIdx;
 
+            // Must be outside, other threadMax might have uninitalized values!
+            float * rowBuf = buf[rowIdx];
+            threadMax[rowIdx] = kMinusInfinity;
+
             if (gy < ny)
             {
-                float * rowBuf = buf[rowIdx];
-                threadMax[rowIdx] = kMinusInfinity;
-
                 // Vectorized load packs in this warp (row), by this thread.
                 // Each threads loads kThreadSpanX elements into its rowBuf (GMEM -> REG).
                 // Loads are done by kNumPacks vectorized packs, each pack of length kPackSize.
