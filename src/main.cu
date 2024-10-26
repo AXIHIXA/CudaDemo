@@ -9,23 +9,12 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 #include <thrust/device_vector.h>
 #include <thrust/equal.h>
 #include <thrust/host_vector.h>
 
 #include "utils/cuda_utils.h"
-
-
-__global__ void test1()
-{
-    __shared__ float smem[32 * 4];
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    float4 reg = {1.0f, 2.0f, 3.0f, 4.0f};
-    auto smem4 = reinterpret_cast<float4 *>(smem);
-    smem4[tid] = reg;
-    __trap();
-    __syncthreads();
-}
 
 
 __global__ void test2()

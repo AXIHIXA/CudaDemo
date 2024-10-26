@@ -12,43 +12,44 @@ def flash_attn_fwd(Q: torch.Tensor,
                    Br: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     """
-    assert Q.size() == K.size() == V.size()
+    assert Q.shape == K.shape == V.shape
     assert Q.device == K.device == V.device
     n: int = Q.size(0)
     d: int = Q.size(1)
-    assert n % Br == 0 and n % Bc == 0
+    dtype = V.dtype
+    device = V.device
 
-    O: torch.Tensor = torch.empty((n, d,), dtype=V.dtype, device=V.device)
-    L: torch.Tensor = torch.empty((n,), dtype=V.dtype, device=V.device)
+    assert n % Bc == 0 and n % Br == 0
+    Tc: int = n // Bc
+    Tr: int = n // Br
 
     softmax_scale: float = 1.0 / math.sqrt(d)
 
-    Tr: int = n // Br
-    Tc: int = n // Bc
+    O: torch.Tensor = torch.empty((n, d,), dtype=dtype, device=device)  # (n, d,)
+    L: torch.Tensor = torch.empty((n,), dtype=dtype, device=device)  # (n,)
 
     for i in range(Tr):
-        Qi = Q[i * Br:(i + 1) * Br, :]  # (Br, d,)
-        Oi = torch.zeros((Br, d,), dtype=V.dtype, device=V.device)  # (Br, d,)
-        m = torch.full((Br,), -torch.inf, dtype=V.dtype, device=V.device)  # (Br,)
-        l = torch.zeros((Br,), dtype=V.dtype, device=V.device)  # (Br,)
+        Qi: torch.Tensor = Q[i * Br:(i + 1) * Br] * softmax_scale  # (Br, d,)
+        Oi: torch.Tensor = torch.zeros((Br, d,), dtype=dtype, device=device)  # (Br, d,)
+
+        m: torch.Tensor = torch.full((Br,), -torch.inf, dtype=dtype, device=device)  # (Br,)
+        l: torch.Tensor = torch.zeros((Br,), dtype=dtype, device=device)  # (Br,)
 
         for j in range(Tc):
-            Kj = K[j * Bc:(j + 1) * Bc, :]  # (Bc, d,)
-            Vj = V[j * Bc:(j + 1) * Bc, :]  # (Bc, d,)
-            S = Qi @ Kj.transpose(-2, -1) * softmax_scale  # (Br, Bc,)
+            Kj: torch.Tensor = K[j * Bc:(j + 1) * Bc]  # (Bc, d,)
+            Vj: torch.Tensor = V[j * Bc:(j + 1) * Bc]  # (Bc, d,)
+            S: torch.Tensor = Qi @ Kj.transpose(-2, -1)  # (Br, Bc,)
 
-            m_old = m  # (Br,)
-            m_new = torch.maximum(m_old, torch.max(S, dim=-1)[0])  # (Br,)
-            m = m_new  # (Br,)
+            m_old: torch.Tensor = m  # (Br,)
+            m = torch.maximum(torch.max(S, dim=-1)[0], m_old)  # (Br,)
 
-            P = torch.exp(S - m_new.unsqueeze(-1))  # (Br, Bc,)
-            l = torch.exp(m_old - m_new) * l + torch.sum(P, dim=-1)  # (Br,)
+            P: torch.Tensor = torch.exp(S - m.unsqueeze(-1))  # (Br, Bc,)
 
-            Oi = torch.diag(torch.exp(m_old - m_new)) @ Oi + P @ Vj  # (Br, Bc,)
+            l = torch.exp(m_old - m) * l + torch.sum(P, dim=-1)  # (Br,)
+            Oi = torch.diag(torch.exp(m_old - m)) @ Oi + P @ Vj  # (Br, Bc,)
 
-        Oi = torch.inverse(torch.diag(l)) @ Oi
-        O[i * Br:(i + 1) * Br, :] = Oi
-        L[i * Br:(i + 1) * Br] = m + torch.log(l)
+        O[i * Br:(i + 1) * Br] = torch.inverse(torch.diag(l)) @ Oi  # (Br, Bc,)
+        L[i * Br:(i + 1) * Br] = m + torch.log(l)  # (Br,)
 
     return O, L
 
