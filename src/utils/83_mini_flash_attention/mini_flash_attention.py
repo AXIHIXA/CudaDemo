@@ -104,17 +104,18 @@ def flash_attn_bwd(Q: torch.Tensor,
             P: torch.Tensor = torch.exp(S - Li.unsqueeze(-1))  # (Br, Bc,)
 
             dVj = dVj + P.transpose(-2, -1) @ dOi  # (Bc, d,)
-            dP: torch.Tensor = dOi @ Vj.transpose(-2, -1)  # (Br, Bc,)
-            dS: torch.Tensor = P * (dP - Di.unsqueeze(-1))  # (Br, Bc,)
+
+            dP = dOi @ Vj.transpose(-2, -1)  # (Br, Bc,)
+            dS = P * (dP - Di.unsqueeze(-1))  # (Br, Bc,)
 
             dQi: torch.Tensor = dQ[i * Br:(i + 1) * Br, :]  # (Br, d,)
-            dQi = dQi + dS @ Kj  # (Br, d,)
+            dQi = dQi + (dS @ Kj * softmax_scale)  # (Br, d,)
             dQ[i * Br:(i + 1) * Br, :] = dQi  # (Br, d,)
 
             dKj = dKj + dS.transpose(-2, -1) @ Qi  # (Bc, d,)
 
-        dK[j * Bc:(j + 1) * Bc, :] = dKj
-        dV[j * Bc:(j + 1) * Bc, :] = dVj
+        dK[j * Bc:(j + 1) * Bc, :] = dKj  # (Bc, d,)
+        dV[j * Bc:(j + 1) * Bc, :] = dVj  # (Bc, d,)
 
     return dQ, dK, dV
 
