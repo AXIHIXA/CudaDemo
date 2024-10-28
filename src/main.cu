@@ -124,7 +124,7 @@ __global__ void softmax(const float * __restrict__ src,
 
     float buf[kThreadSpanY][kThreadSpanX];
 
-    // Grid translation.
+    // Grid translation
     for (int baseY = globalWarpIdx * kThreadSpanY; baseY < ny; baseY += globalWarps * kThreadSpanY)
     {
         float threadMax[kThreadSpanY];
@@ -133,23 +133,23 @@ __global__ void softmax(const float * __restrict__ src,
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
             const int gy = baseY + rowIdx;
-
-            float * rowBuf = buf[rowIdx];
             threadMax[rowIdx] = -INFINITY;
 
             if (gy < ny)
             {
+                float * rowBuf = buf[rowIdx];
+
                 #pragma unroll
                 for (int packIdx = 0; packIdx < kPacks; ++packIdx)
                 {
-                    // p0 p0 p0 p1 p1 p1 ...
+                    // p0 p0 p0 p1 p1 p1 p2 p2 p2 ...
                     const int gx = packIdx * kPackSize * kWarpThreads + laneIdx * kPackSize;
                     const int packOffset = packIdx * kPackSize;
 
                     if (gx < nx)
                     {
                         *reinterpret_cast<Vec *>(rowBuf + packOffset) =
-                            *reinterpret_cast<const Vec *>(src + gy * nx + gx);
+                                *reinterpret_cast<const Vec *>(src + gy * nx + gx);
 
                         #pragma unroll
                         for (int pi = 0; pi < kPackSize; ++pi)
@@ -174,7 +174,7 @@ __global__ void softmax(const float * __restrict__ src,
         #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
-            rowMax[rowIdx] = warpReduce<Max, float>(threadMax[rowIdx]);
+            rowMax[rowIdx] = warpReduce<Max>(threadMax[rowIdx]);
         }
 
         float threadSum[kThreadSpanY];
@@ -198,34 +198,35 @@ __global__ void softmax(const float * __restrict__ src,
         #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
-            rowSum[rowIdx] = warpReduce<Sum, float>(threadSum[rowIdx]);
+            rowSum[rowIdx] = warpReduce<Sum>(threadSum[rowIdx]);
         }
 
         #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
             const int gy = baseY + rowIdx;
-            float * rowBuf = buf[rowIdx];
 
             if (gy < ny)
             {
+                float * rowBuf = buf[rowIdx];
+
                 #pragma unroll
                 for (int xi = 0; xi < kThreadSpanX; ++xi)
                 {
-                    rowBuf[xi] /= rowSum[rowIdx];
+                    rowBuf[xi] = rowBuf[xi] / rowSum[rowIdx];
                 }
 
                 #pragma unroll
                 for (int packIdx = 0; packIdx < kPacks; ++packIdx)
                 {
-                    // p0 p0 p0 p1 p1 p1 ...
+                    // p0 p0 p0 p1 p1 p1 p2 p2 p2 ...
                     const int gx = packIdx * kPackSize * kWarpThreads + laneIdx * kPackSize;
                     const int packOffset = packIdx * kPackSize;
 
                     if (gx < nx)
                     {
                         *reinterpret_cast<Vec *>(dst + gy * nx + gx) =
-                            *reinterpret_cast<Vec *>(rowBuf + packOffset);
+                                *reinterpret_cast<Vec *>(rowBuf + packOffset);
                     }
                 }
             }
