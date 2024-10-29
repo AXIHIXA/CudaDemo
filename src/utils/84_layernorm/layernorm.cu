@@ -33,14 +33,14 @@ void cpuLayerNorm(const float * __restrict__ src,
             rowMean += src[y * nx + x] / static_cast<float>(nx);
         }
 
-        float rowVarNumerator = 0.0f;
+        float rowVar = 0.0f;
 
         for (int x = 0; x < nx; ++x)
         {
-            rowVarNumerator += (src[y * nx + x] - rowMean) * (src[y * nx + x] - rowMean);
+            rowVar += (src[y * nx + x] - rowMean) * (src[y * nx + x] - rowMean) / static_cast<float>(nx);
         }
 
-        float rowStd = std::sqrt(rowVarNumerator / static_cast<float>(nx) + eps);
+        float rowStd = std::sqrt(rowVar + eps);
 
         for (int x = 0; x < nx; ++x)
         {
@@ -132,18 +132,19 @@ __global__ void layerNorm(const float * __restrict__ src,
     // Grid translation
     for (int baseY = globalWarpIdx * kThreadSpanY; baseY < ny; baseY += globalWarps * kThreadSpanY)
     {
-        // Input, and calculate thread mean.
-        float threadMean[kThreadSpanY];
+        // Input, and calculate thread sum.
+        float threadSum[kThreadSpanY];
 
         // Not all threads have kThreadSpanX elements.
         // Used when calculating row std dev.
-        int threadElements = 0;
+        int threadElements[kThreadSpanY];
 
         #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
             const int gy = baseY + rowIdx;
-            threadMean[rowIdx] = 0;
+            threadSum[rowIdx] = 0;
+            threadElements[rowIdx] = 0;
 
             if (gy < ny)
             {
@@ -164,10 +165,10 @@ __global__ void layerNorm(const float * __restrict__ src,
                         #pragma unroll
                         for (int pi = 0; pi < kPackSize; ++pi)
                         {
-                            threadMean[rowIdx] += rowBuf[packOffset + pi];
+                            threadSum[rowIdx] += rowBuf[packOffset + pi];
                         }
 
-                        threadElements += kPackSize;
+                        threadElements[rowIdx] += kPackSize;
                     }
                     else
                     {
@@ -187,25 +188,22 @@ __global__ void layerNorm(const float * __restrict__ src,
         #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
-            rowMean[rowIdx] = warpReduce<Sum>(threadMean[rowIdx]);
-            rowMean[rowIdx] /= static_cast<float>(nx);
+            rowMean[rowIdx] = warpReduce<Sum>(threadSum[rowIdx]) / static_cast<float>(nx);
         }
 
-        // In-place substract row mean, and reduce thread-level numerator for row variance.
-        float threadVarNumerator[kThreadSpanY];
-
+        // In-place substract row mean, and reduce thread-level numerator for row variance (store into threadSum).
         #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
             float * rowBuf = buf[rowIdx];
-            threadVarNumerator[rowIdx] = 0;
+            threadSum[rowIdx] = 0;
 
             // Less than threadElements (rather than kThreadSpanX)
             // s.t. dummies do not contribute to row variance.
-            for (int xi = 0; xi < threadElements; ++xi)
+            for (int xi = 0; xi < threadElements[rowIdx]; ++xi)
             {
                 rowBuf[xi] = rowBuf[xi] - rowMean[rowIdx];
-                threadVarNumerator[rowIdx] += rowBuf[xi] * rowBuf[xi];
+                threadSum[rowIdx] += rowBuf[xi] * rowBuf[xi];
             }
         }
 
@@ -215,8 +213,8 @@ __global__ void layerNorm(const float * __restrict__ src,
         #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
-            float rowVarNumerator = warpReduce<Sum>(threadVarNumerator[rowIdx]);
-            rowStd[rowIdx] = sqrt((rowVarNumerator) / static_cast<float>(nx) + eps);
+            float rowVar = warpReduce<Sum>(threadSum[rowIdx]) / static_cast<float>(nx);
+            rowStd[rowIdx] = sqrt(rowVar + eps);
         }
 
         // Write-back.
@@ -244,8 +242,7 @@ __global__ void layerNorm(const float * __restrict__ src,
 
                     if (gx < nx)
                     {
-                        *reinterpret_cast<Vec *>(dst + gy * nx + gx) =
-                                *reinterpret_cast<Vec *>(rowBuf + packOffset);
+                        *reinterpret_cast<Vec *>(dst + gy * nx + gx) = *reinterpret_cast<Vec *>(rowBuf + packOffset);
                     }
                 }
             }
@@ -304,7 +301,7 @@ void checkResult(const float * __restrict__ res,
             return;
         }
 
-        printf("res:\n");
+        printf("Last three rows in res:\n");
 
         for (int y = 0; y < 2; ++y)
         {
@@ -316,7 +313,7 @@ void checkResult(const float * __restrict__ res,
             printf("\n");
         }
 
-        printf("\n\ngt :\n");
+        printf("\n\nLast three rows in gt:\n");
 
         for (int y = 0; y < 2; ++y)
         {
@@ -357,8 +354,8 @@ int main(int argc, char * argv[])
     {
         unsigned seed = std::random_device()();
         std::default_random_engine e(seed);
-        // std::normal_distribution<float> d(4.0f, 1.0f);
-        std::uniform_real_distribution<float> d(1, 10);
+        std::normal_distribution<float> d(4.0f, 1.0f);
+        // std::uniform_real_distribution<float> d(1, 4);
         auto g = [&e, &d]() -> float { return d(e); };
         std::generate(hostSrc.begin(), hostSrc.end(), g);
     }
@@ -380,7 +377,7 @@ int main(int argc, char * argv[])
 
     constexpr dim3 kBlock(32, 8);
     constexpr int kThreadSpanX = 32;
-    constexpr int kThreadSpanY = 1;
+    constexpr int kThreadSpanY = 4;
     constexpr int kBlockSpanX = kThreadSpanX * kBlock.x;
     constexpr int kBlockSpanY = kThreadSpanY * kBlock.y;
 

@@ -14,30 +14,37 @@
 #include "utils/cuda_utils.h"
 
 
-/// RMSNorm
-/// https://pytorch.org/docs/stable/generated/torch.nn.RMSNorm.html
-void cpuRmsNorm(const float * __restrict__ src,
-                float * __restrict__ dst,
-                int nx,
-                int ny,
-                float eps = 1e-5f,
-                float gamma = 1.0f)
+/// LayerNorm.
+/// https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
+void cpuLayerNorm(const float * __restrict__ src,
+                  float * __restrict__ dst,
+                  int nx,
+                  int ny,
+                  float eps = 1e-5f,
+                  float gamma = 1.0f,
+                  float beta = 0.0f)
 {
     for (int y = 0; y < ny; ++y)
     {
-        float rowSquare = 0.0f;
+        float rowMean = 0.0f;
 
         for (int x = 0; x < nx; ++x)
         {
-            rowSquare += src[y * nx + x] * src[y * nx + x];
+            rowMean += src[y * nx + x] / static_cast<float>(nx);
         }
 
-        float rowRms = std::sqrt(rowSquare / static_cast<float>(nx));
-        float rowRmsScale = 1.0f / std::sqrt(rowRms + eps) * gamma;
+        float rowVar = 0.0f;
 
         for (int x = 0; x < nx; ++x)
         {
-            dst[y * nx + x] = src[y * nx + x] * rowRmsScale;
+            rowVar += (src[y * nx + x] - rowMean) * (src[y * nx + x] - rowMean) / static_cast<float>(nx);
+        }
+
+        float rowStd = std::sqrt(rowVar + eps);
+
+        for (int x = 0; x < nx; ++x)
+        {
+            dst[y * nx + x] = (src[y * nx + x] - rowMean) / rowStd * gamma + beta;
         }
     }
 }
@@ -90,12 +97,13 @@ struct alignas(sizeof(T) * kSize) Vec
 /// Each row in thread block constitutes a warp.
 /// Grid is 1D, spans in y direction.
 template <int kBlockDimX = 32, int kBlockDimY, int kThreadSpanX, int kThreadSpanY, int kPackSize, int kWarpThreads = 32>
-__global__ void rmsNorm(const float * __restrict__ src,
-                        float * __restrict__ dst,
-                        int nx,
-                        int ny,
-                        float eps = 1e-5f,
-                        float gamma = 1.0f)
+__global__ void layerNorm(const float * __restrict__ src,
+                          float * __restrict__ dst,
+                          int nx,
+                          int ny,
+                          float eps = 1e-5f,
+                          float gamma = 1.0f,
+                          float beta = 0.0f)
 {
     // Alignment requirements for vectorized loads/stores.
     // Each warp must be long enough to cover a row.
@@ -124,14 +132,19 @@ __global__ void rmsNorm(const float * __restrict__ src,
     // Grid translation
     for (int baseY = globalWarpIdx * kThreadSpanY; baseY < ny; baseY += globalWarps * kThreadSpanY)
     {
-        // Input, and accumulate thread square.
-        float threadSquare[kThreadSpanY];
+        // Input, and calculate thread sum.
+        float threadSum[kThreadSpanY];
+
+        // Not all threads have kThreadSpanX elements.
+        // Used when calculating row std dev.
+        int threadElements[kThreadSpanY];
 
         #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
             const int gy = baseY + rowIdx;
-            threadSquare[rowIdx] = 0;
+            threadSum[rowIdx] = 0;
+            threadElements[rowIdx] = 0;
 
             if (gy < ny)
             {
@@ -152,8 +165,10 @@ __global__ void rmsNorm(const float * __restrict__ src,
                         #pragma unroll
                         for (int pi = 0; pi < kPackSize; ++pi)
                         {
-                            threadSquare[rowIdx] += rowBuf[packOffset + pi] * rowBuf[packOffset + pi];
+                            threadSum[rowIdx] += rowBuf[packOffset + pi];
                         }
+
+                        threadElements[rowIdx] += kPackSize;
                     }
                     else
                     {
@@ -167,14 +182,39 @@ __global__ void rmsNorm(const float * __restrict__ src,
             }
         }
 
-        // Reduce row RMS, and in-place convert to rms scale.
-        float rowRms[kThreadSpanY];
+        // Reduce row mean.
+        float rowMean[kThreadSpanY];
 
         #pragma unroll
         for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
         {
-            rowRms[rowIdx] = sqrt(warpReduce<Sum>(threadSquare[rowIdx]) / static_cast<float>(nx));
-            rowRms[rowIdx] = 1.0 / sqrt(rowRms[rowIdx] + eps) * gamma;
+            rowMean[rowIdx] = warpReduce<Sum>(threadSum[rowIdx]) / static_cast<float>(nx);
+        }
+
+        // In-place substract row mean, and reduce thread-level numerator for row variance (store into threadSum).
+        #pragma unroll
+        for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
+        {
+            float * rowBuf = buf[rowIdx];
+            threadSum[rowIdx] = 0;
+
+            // Less than threadElements (rather than kThreadSpanX)
+            // s.t. dummies do not contribute to row variance.
+            for (int xi = 0; xi < threadElements[rowIdx]; ++xi)
+            {
+                rowBuf[xi] = rowBuf[xi] - rowMean[rowIdx];
+                threadSum[rowIdx] += rowBuf[xi] * rowBuf[xi];
+            }
+        }
+
+        // Reduce row std dev.
+        float rowStd[kThreadSpanY];
+
+        #pragma unroll
+        for (int rowIdx = 0; rowIdx < kThreadSpanY; ++rowIdx)
+        {
+            float rowVar = warpReduce<Sum>(threadSum[rowIdx]) / static_cast<float>(nx);
+            rowStd[rowIdx] = sqrt(rowVar + eps);
         }
 
         // Write-back.
@@ -190,7 +230,7 @@ __global__ void rmsNorm(const float * __restrict__ src,
                 #pragma unroll
                 for (int xi = 0; xi < kThreadSpanX; ++xi)
                 {
-                    rowBuf[xi] *= rowRms[rowIdx];
+                    rowBuf[xi] = rowBuf[xi] / rowStd[rowIdx] * gamma + beta;
                 }
 
                 #pragma unroll
@@ -202,8 +242,7 @@ __global__ void rmsNorm(const float * __restrict__ src,
 
                     if (gx < nx)
                     {
-                        *reinterpret_cast<Vec *>(dst + gy * nx + gx) =
-                                *reinterpret_cast<Vec *>(rowBuf + packOffset);
+                        *reinterpret_cast<Vec *>(dst + gy * nx + gx) = *reinterpret_cast<Vec *>(rowBuf + packOffset);
                     }
                 }
             }
@@ -262,7 +301,7 @@ void checkResult(const float * __restrict__ res,
             return;
         }
 
-        printf("res:\n");
+        printf("Last three rows in res:\n");
 
         for (int y = 0; y < 2; ++y)
         {
@@ -274,7 +313,7 @@ void checkResult(const float * __restrict__ res,
             printf("\n");
         }
 
-        printf("\n\ngt :\n");
+        printf("\n\nLast three rows in gt:\n");
 
         for (int y = 0; y < 2; ++y)
         {
@@ -315,14 +354,14 @@ int main(int argc, char * argv[])
     {
         unsigned seed = std::random_device()();
         std::default_random_engine e(seed);
-        // std::normal_distribution<float> d(4.0f, 1.0f);
-        std::uniform_real_distribution<float> d(1, 10);
+        std::normal_distribution<float> d(4.0f, 1.0f);
+        // std::uniform_real_distribution<float> d(1, 4);
         auto g = [&e, &d]() -> float { return d(e); };
         std::generate(hostSrc.begin(), hostSrc.end(), g);
     }
 
     thrust::host_vector<float> gt(ny * nx, 1.0f);
-    cpuRmsNorm(hostSrc.data(), gt.data(), nx, ny);
+    cpuLayerNorm(hostSrc.data(), gt.data(), nx, ny);
 
     thrust::device_vector<float> devSrc = hostSrc;
     thrust::device_vector<float> devDst(ny * nx);
@@ -338,7 +377,7 @@ int main(int argc, char * argv[])
 
     constexpr dim3 kBlock(32, 8);
     constexpr int kThreadSpanX = 32;
-    constexpr int kThreadSpanY = 1;
+    constexpr int kThreadSpanY = 4;
     constexpr int kBlockSpanX = kThreadSpanX * kBlock.x;
     constexpr int kBlockSpanY = kThreadSpanY * kBlock.y;
 
@@ -349,7 +388,7 @@ int main(int argc, char * argv[])
     {
         if constexpr (1 < kDup)
         {
-            rmsNorm<kBlock.x, kBlock.y, kThreadSpanX, kThreadSpanY, kPackSize, kWarpThreads><<<grid, kBlock>>>(
+            layerNorm<kBlock.x, kBlock.y, kThreadSpanX, kThreadSpanY, kPackSize, kWarpThreads><<<grid, kBlock>>>(
                     thrust::raw_pointer_cast(devSrc.data()),
                     thrust::raw_pointer_cast(devDst.data()),
                     nx,
@@ -362,7 +401,7 @@ int main(int argc, char * argv[])
 
         for (int dup = 0; dup < kDup; ++dup)
         {
-            rmsNorm<kBlock.x, kBlock.y, kThreadSpanX, kThreadSpanY, kPackSize, kWarpThreads><<<grid, kBlock>>>(
+            layerNorm<kBlock.x, kBlock.y, kThreadSpanX, kThreadSpanY, kPackSize, kWarpThreads><<<grid, kBlock>>>(
                     thrust::raw_pointer_cast(devSrc.data()),
                     thrust::raw_pointer_cast(devDst.data()),
                     nx,
@@ -377,7 +416,7 @@ int main(int argc, char * argv[])
 
         hostDst = devDst;
 
-        std::printf("rmsNorm: ");
+        std::printf("layerNorm: ");
         CUDA_CHECK(cudaEventElapsedTime(&ms, ss, ee));
         std::printf("took %f ms, ", ms / kDup);
 
