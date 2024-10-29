@@ -25,6 +25,10 @@ More details are available in `src/utils/`.
 - Softmax: `src/utils/11_softmax`
   - Implemented at warp's perspective (Registers directly, no SMEM).
   - Vectorized loads and stores as optmization. 
+- LayerNorm: `src/utils/84_layernorm`
+  - Similar implementation considerations as softmax.
+- RMSNorm: `src/utils/85_rmsnorm`
+  - Similar implementation considerations as softmax and layernorm.
 - Measure Peak Performance: `src/utils/12_measure_peak_performance`
   - Evaluates GMEM bandwidth by vectorized loads. 
     - GMEM bandwidth is evaluated by oversized loads (so that L2 cache gets flushed.)
