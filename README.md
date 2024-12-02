@@ -7,7 +7,7 @@ More details are available in `src/utils/`.
 ## Implemented Kernels (And Benchmarked Variants)
 
 - Reduction: `src/utils/05_reduce`
-  - Naive GEMM
+  - Naive GMEM
   - SMEM version
   - Multiple elements per thread
   - Loop unrolling and last-warp unrolled
