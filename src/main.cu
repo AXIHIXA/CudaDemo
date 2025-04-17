@@ -69,25 +69,25 @@ __global__ void softmax(
         )
 {
     Mdf<T> tmp;
-    Mdf<T> mdf = { -INFINITY, 0 };
-    __shared__ Mdf<T> rowMdf;
-
-    using BlockReduce = cub::BlockReduce<Mdf<T>, kBlockDimX>;
-    __shared__ typename BlockReduce::TempStorage tempStorage;
+    Mdf<T> runningMdf = { -INFINITY, 0 };
 
     // Block shifts across the whole row.
     for (int i = threadIdx.x; i < nCols; i += kBlockDimX)
     {
         tmp.m = src[blockIdx.x * nCols + i];
-        tmp.d = 1;
-        mdf = MdfOp()(mdf, tmp);
+        tmp.d = 1;  // IMPORTANT! MUST BE 1 (NOT 0!)
+        runningMdf = MdfOp()(runningMdf, tmp);
     }
 
-    mdf = BlockReduce(tempStorage).Reduce(mdf, MdfOp());
+    using BlockReduce = cub::BlockReduce<Mdf<T>, kBlockDimX>;
+    __shared__ typename BlockReduce::TempStorage tempStorage;
+    runningMdf = BlockReduce(tempStorage).Reduce(runningMdf, MdfOp());
+
+    __shared__ Mdf<T> rowMdf;
 
     if (0 == threadIdx.x)
     {
-        rowMdf = mdf;
+        rowMdf = runningMdf;
     }
 
     __syncthreads();
