@@ -52,12 +52,68 @@ struct MdfOp
     template <typename T>
     __device__ __forceinline__ Mdf<T> operator()(const Mdf<T> & a, const Mdf<T> & b) const
     {
-        Mdf<T> ans = {};
+        Mdf<T> ans;
         ans.m = max(a.m, b.m);
         ans.d = a.d * exp(a.m - ans.m) + b.d * exp(b.m - ans.m);
         return ans;
     }
 };
+
+
+template <typename T, int kWarpSize = 32>
+__device__ __forceinline__ Mdf<T> warpReduce(Mdf<T> data)
+{
+    #pragma unroll
+    for (int laneMask = kWarpSize >> 1; 0 != laneMask; laneMask >>= 1)
+    {
+        // CUDA C++ Programming Guide
+        // 7.22. Warp Shuffle Functions
+        // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions
+        // T __shfl_xor_sync(unsigned mask, T var, int laneMask, int width=warpSize);
+        Mdf<T> other;
+        other.m = __shfl_xor_sync(0xffffffffu, data.m, laneMask, kWarpSize);
+        other.d = __shfl_xor_sync(0xffffffffu, data.d, laneMask, kWarpSize);
+        Mdf<T> ans;
+        ans.m = max(data.m, other.m);
+        ans.d = data.d * exp(data.m - ans.m) + other.d * exp(other.m - ans.m);
+        data = ans;
+    }
+
+    return data;
+}
+
+
+template <int kBlockDimX, typename T, typename Op, int kWarpSize = 32>
+__device__ void blockReduce(Mdf<T> & data, Op op)
+{
+    static_assert(0 == kBlockDimX % kWarpSize);
+    constexpr int nWarps = kBlockDimX / kWarpSize;
+    __shared__ Mdf<T> temp[nWarps];
+
+    const int linear_tid = threadIdx.x;
+    const int lane_id = linear_tid % kWarpSize;
+    const int warp_id = linear_tid / kWarpSize;
+
+    data = warpReduce(data);
+
+    if (0 == lane_id)
+    {
+        temp[warp_id] = data;
+    }
+
+    __syncthreads();
+
+    if (0 == linear_tid)
+    {
+        data = temp[0];
+
+        #pragma unroll
+        for (int i = 1; i < nWarps; ++i)
+        {
+            data = op(data, temp[i]);
+        }
+    }
+}
 
 
 // Online softmax, each block handles a row.
@@ -72,8 +128,8 @@ __global__ void softmax(
     Mdf<T> mdf = { -INFINITY, 0 };
     __shared__ Mdf<T> rowMdf;
 
-    using BlockReduce = cub::BlockReduce<Mdf<T>, kBlockDimX>;
-    __shared__ typename BlockReduce::TempStorage tempStorage;
+//    using BlockReduce = cub::BlockReduce<Mdf<T>, kBlockDimX>;
+//    __shared__ typename BlockReduce::TempStorage tempStorage;
 
     // Block shifts across the whole row.
     for (int i = threadIdx.x; i < nCols; i += kBlockDimX)
@@ -83,7 +139,8 @@ __global__ void softmax(
         mdf = MdfOp()(mdf, tmp);
     }
 
-    mdf = BlockReduce(tempStorage).Reduce(mdf, MdfOp());
+//    mdf = BlockReduce(tempStorage).Reduce(mdf, MdfOp());
+    blockReduce<kBlockDimX>(mdf, MdfOp());
 
     if (0 == threadIdx.x)
     {
