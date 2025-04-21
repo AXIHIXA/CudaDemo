@@ -61,6 +61,7 @@ struct MdfOp
 
 
 // Online softmax, each block handles a row.
+// The grid and block must be one-dimensional.
 template <int kBlockDimX, typename T>
 __global__ void softmax(
         const T * __restrict__ src,
@@ -68,33 +69,36 @@ __global__ void softmax(
         T * __restrict__ dst
         )
 {
-    Mdf<T> tmp;
-    Mdf<T> runningMdf = { -INFINITY, 0 };
+    const int gy = blockIdx.x;
+    const int linear_tid = threadIdx.x;
 
-    // Block shifts across the whole row.
-    for (int i = threadIdx.x; i < nCols; i += kBlockDimX)
+    Mdf<T> tmp = {};
+    Mdf<T> runningMdf = { -INFINITY, 0 };
+    MdfOp op;
+
+    for (int gx = linear_tid; gx < nCols; gx += kBlockDimX)
     {
-        tmp.m = src[blockIdx.x * nCols + i];
-        tmp.d = 1;  // IMPORTANT! MUST BE 1 (NOT 0!)
-        runningMdf = MdfOp()(runningMdf, tmp);
+        tmp.m = src[gy * nCols + gx];
+        tmp.d = 1;  // IMPORTENT! MUST BE 1! (NOT 0!)
+        runningMdf = op(runningMdf, tmp);
     }
 
     using BlockReduce = cub::BlockReduce<Mdf<T>, kBlockDimX>;
     __shared__ typename BlockReduce::TempStorage tempStorage;
-    runningMdf = BlockReduce(tempStorage).Reduce(runningMdf, MdfOp());
+    runningMdf = BlockReduce(tempStorage).Reduce(runningMdf, op);
 
     __shared__ Mdf<T> rowMdf;
 
-    if (0 == threadIdx.x)
+    if (0 == linear_tid)
     {
         rowMdf = runningMdf;
     }
 
     __syncthreads();
 
-    for (int i = threadIdx.x; i < nCols; i += kBlockDimX)
+    for (int gx = linear_tid; gx < nCols; gx += kBlockDimX)
     {
-        dst[blockIdx.x * nCols + i] = exp(src[blockIdx.x * nCols + i] - rowMdf.m) / rowMdf.d;
+        dst[gy * nCols + gx] = exp(src[gy * nCols + gx] - rowMdf.m) / rowMdf.d;
     }
 }
 
