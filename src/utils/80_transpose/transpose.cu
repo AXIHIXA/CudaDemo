@@ -76,7 +76,6 @@ __global__ void transpose(const T * __restrict__ src, int nx, int ny, T * __rest
 }
 
 
-
 void print(const thrust::host_vector<float> & in, int r, int c, const thrust::host_vector<float> & out)
 {
     for (int i = 0; i < r; ++i)

@@ -40,21 +40,23 @@ void cpuSoftmax(const float * __restrict__ in, float * __restrict__ out, int nx,
     }
 }
 
+
 template <typename T>
-struct alignas(sizeof(T) * 2) Mdf
+struct alignas(2 * sizeof(T)) SoftmaxData
 {
-    T m;  // max
-    T d;  // exp sum
+    T max;
+    T expSum;
 };
 
-struct MdfOp
+
+struct SoftmaxOp
 {
     template <typename T>
-    __device__ __forceinline__ Mdf<T> operator()(const Mdf<T> & a, const Mdf<T> & b) const
+    __device__ __forceinline__ SoftmaxData<T> operator()(const SoftmaxData<T> & a, const SoftmaxData<T> & b) const
     {
-        Mdf<T> ans = {};
-        ans.m = max(a.m, b.m);
-        ans.d = a.d * exp(a.m - ans.m) + b.d * exp(b.m - ans.m);
+        SoftmaxData<T> ans = {};
+        ans.max = max(a.max, b.max);
+        ans.expSum = a.expSum * exp(a.max - ans.max) + b.expSum * exp(b.max - ans.max);
         return ans;
     }
 };
@@ -69,38 +71,42 @@ __global__ void softmax(
         T * __restrict__ dst
         )
 {
-    const int gy = blockIdx.x;
-    const int linear_tid = threadIdx.x;
+    const int gy = static_cast<int>(blockIdx.x);
+    const int linear_tid = static_cast<int>(threadIdx.x);
 
-    Mdf<T> tmp = {};
-    Mdf<T> runningMdf = { -INFINITY, 0 };
-    MdfOp op;
+    SoftmaxData<T> tmp = {};
+    SoftmaxData<T> acc = { -INFINITY, 0 };
+    SoftmaxOp op;
 
     for (int gx = linear_tid; gx < nCols; gx += kBlockDimX)
     {
-        tmp.m = src[gy * nCols + gx];
-        tmp.d = 1;  // IMPORTENT! MUST BE 1! (NOT 0!)
-        runningMdf = op(runningMdf, tmp);
+        tmp.max = src[gy * nCols + gx];
+        tmp.expSum = 1;
+        acc = op(acc, tmp);
     }
 
-    using BlockReduce = cub::BlockReduce<Mdf<T>, kBlockDimX>;
+    using BlockReduce = cub::BlockReduce<SoftmaxData<T>, kBlockDimX>;
     __shared__ typename BlockReduce::TempStorage tempStorage;
-    runningMdf = BlockReduce(tempStorage).Reduce(runningMdf, op);
+    acc = BlockReduce(tempStorage).Reduce(acc, op);
+    // No need to __syncthreads() here as we won't use __shared__ tempStorage afterward.
 
-    __shared__ Mdf<T> rowMdf;
+    // Initialization is not supported for __shared__ variables.
+    __shared__ SoftmaxData<T> rowAcc;
 
     if (0 == linear_tid)
     {
-        rowMdf = runningMdf;
+        rowAcc = acc;
     }
 
+    // This one is necessary as __shared__ rowAcc will be accessed afterward.
     __syncthreads();
 
     for (int gx = linear_tid; gx < nCols; gx += kBlockDimX)
     {
-        dst[gy * nCols + gx] = exp(src[gy * nCols + gx] - rowMdf.m) / rowMdf.d;
+        dst[gy * nCols + gx] = exp(src[gy * nCols + gx] - rowAcc.max) / rowAcc.expSum;
     }
 }
+
 
 template <typename T>
 struct Equal
