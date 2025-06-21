@@ -40,16 +40,16 @@ __global__ void transposeNaive(const T * __restrict__ in, int nx, int ny, T * __
 /// (with these in-bound threads write NOTHING)
 /// but written by out-of-bound threads!
 template <int kBlockDimX, int kBlockDimY, int kPadding = 1, typename T>
-__global__ void transpose(const T * __restrict__ src, int nx, int ny, T * __restrict__ dst)
+__global__ void transpose(const T * __restrict__ src, const int nx, const int ny, T * __restrict__ dst)
 {
-    // SMEM of shape (kBlockDimY, kLdS).
+    // SMEM of shape (kBlockDimY, kSmemStride).
     extern __shared__ T smem[];
-    constexpr int kLdS = kBlockDimX + kPadding;
+    constexpr int kSmemStride = kBlockDimX + kPadding;
 
     int gx = blockIdx.x * kBlockDimX + threadIdx.x;
     int gy = blockIdx.y * kBlockDimY + threadIdx.y;
     int gi = gy * nx + gx;
-    int si = threadIdx.y * kLdS + threadIdx.x;
+    int si = threadIdx.y * kSmemStride + threadIdx.x;
 
     if (gx < nx && gy < ny)
     {
@@ -58,12 +58,13 @@ __global__ void transpose(const T * __restrict__ src, int nx, int ny, T * __rest
 
     __syncthreads();
 
-    // This thread will write t-th (column major) element in smem.
-    // What's its x, y coordinates in this block?
+    // This thread reads (threadIdx.y, threadIdx.x)-th element in the (kBlockDimY, kBlockDimX) input submatrix.
+    // It will write the (tid % kBlockDimY, tid / kBlockDimY)-th element in the (kBlockDimX, kBlockDimY) output submatrix.
+    // I.e., each block both reads and writes in row-major order.
     const int tid = threadIdx.y * kBlockDimX + threadIdx.x;
     const int sx = tid / kBlockDimY;
     const int sy = tid % kBlockDimY;
-    si = sy * kLdS + sx;
+    si = sy * kSmemStride + sx;
 
     gx = blockIdx.y * kBlockDimY + sy;
     gy = blockIdx.x * kBlockDimX + sx;

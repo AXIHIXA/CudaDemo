@@ -146,7 +146,7 @@ __device__ void blockSmemReduce(T * __restrict__ smem)
 // Adapts to input size automatically, at a cost of degraded performance.
 // Trade-off.
 template <int kBlockDimX, typename T>
-__global__ void reduceGridTranslationRaking(const T * __restrict__ src, int nx, T * __restrict__ dst)
+__global__ void reduceGridTranslationRaking(const T * __restrict__ src, const int nx, T * __restrict__ dst)
 {
     const int tid = static_cast<int>(threadIdx.x);
     const int offset = blockIdx.x * kBlockDimX;
@@ -199,7 +199,7 @@ __device__ T warpReduce(T x)
 /// Reach best performance when input size is around 25'600.
 /// Degrades to sub-optimal when input size grows larger.
 template <int kBlockDimX, typename T, int kWarpSize = 32>
-__global__ void reduceGridTranslationWarpShuffle(const T * __restrict__ src, int nx, T * __restrict__ dst)
+__global__ void reduceGridTranslationWarpShuffle(const T * __restrict__ src, const int nx, T * __restrict__ dst)
 {
     const int tid = static_cast<int>(threadIdx.x);
     const int offset = blockIdx.x * kBlockDimX;
